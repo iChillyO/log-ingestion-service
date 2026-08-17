@@ -1,0 +1,37 @@
+{
+  "name": "log-ingestion-service",
+  "version": "1.0.0",
+  "description": "High-throughput structured log ingestion and query service backed by PostgreSQL.",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/server.js",
+    "dev": "tsx watch src/server.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "loadtest": "tsx scripts/load-smoke.ts"
+  },
+  "keywords": [
+    "logs",
+    "postgres",
+    "fastify"
+  ],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "fastify": "^5.11.2",
+    "pg": "^8.22.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "@types/pg": "^8.20.3",
+    "tsx": "^4.23.5",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.10"
+  }
+}

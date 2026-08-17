@@ -1,0 +1,98 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: logs-postgres
+    environment:
+      POSTGRES_USER: logs
+      POSTGRES_PASSWORD: logs
+      POSTGRES_DB: logs
+      # Tuned for ~1 GB RAM container. shared_buffers ~25% of RAM,
+      # effective_cache_size ~50%, work_mem sized for aggregation queries.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    command:
+      - "postgres"
+      - "-c"
+      - "shared_buffers=256MB"
+      - "-c"
+      - "effective_cache_size=512MB"
+      - "-c"
+      - "work_mem=32MB"
+      - "-c"
+      - "maintenance_work_mem=128MB"
+      - "-c"
+      - "wal_compression=on"
+      - "-c"
+      - "synchronous_commit=off"
+      - "-c"
+      - "max_wal_size=1GB"
+      - "-c"
+      - "min_wal_size=128MB"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      - "-c"
+      - "random_page_cost=1.1"
+      - "-c"
+      - "max_connections=100"
+      - "-c"
+      - "jit=off"
+      # Aggressive autovacuum on the logs partitions - fresh rows have to be
+      # visibility-marked promptly so aggregation queries can use an Index
+      # Only Scan without heap fetches. Retention drops old partitions so
+      # wraparound risk is nil.
+      - "-c"
+      - "autovacuum_vacuum_scale_factor=0.02"
+      - "-c"
+      - "autovacuum_vacuum_insert_scale_factor=0.02"
+      - "-c"
+      - "autovacuum_naptime=10s"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U logs -d logs"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    cpus: 1.0
+    mem_limit: 1g
+    mem_reservation: 512m
+
+  app:
+    build:
+      context: .
+    container_name: logs-app
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      NODE_ENV: production
+      PORT: 8080
+      DATABASE_URL: postgres://logs:logs@postgres:5432/logs
+      LOG_LEVEL: info
+      INGEST_MAX_BATCH: "1000"
+      INGEST_MAX_BODY_BYTES: "5242880"
+      RETENTION_DAYS: "30"
+      RETENTION_SWEEP_INTERVAL_MS: "300000"
+      RETENTION_PARTITION_LOOKAHEAD_DAYS: "2"
+      AUTH_ENABLED: "false"
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "node",
+          "-e",
+          "fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))",
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 10s
+    cpus: 0.5
+    mem_limit: 256m
+    mem_reservation: 128m
+
+volumes:
+  postgres-data:
