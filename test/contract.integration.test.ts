@@ -25,6 +25,7 @@ suite("contract (integration)", () => {
     pool = new Pool({ connectionString: dbUrl });
     // Fresh schema per run so tests are deterministic.
     await pool.query(`DROP TABLE IF EXISTS logs CASCADE`);
+    await pool.query(`DROP TABLE IF EXISTS logs_rollup CASCADE`);
     await pool.query(`DROP TABLE IF EXISTS schema_migrations CASCADE`);
     await pool.query(`DROP TYPE IF EXISTS log_level CASCADE`);
     await pool.query(`DROP SEQUENCE IF EXISTS logs_id_seq CASCADE`);
@@ -218,6 +219,54 @@ suite("contract (integration)", () => {
     expect(res.statusCode).toBe(200);
     const body = res.json() as { buckets: Array<{ group: string | null }> };
     for (const b of body.buckets) expect(b.group).toBeNull();
+  });
+
+  it("GET /logs/aggregate rollup path matches exact unaligned counts", async () => {
+    const base = new Date("2026-03-01T10:00:00.000Z");
+    await app.inject({
+      method: "POST",
+      url: "/logs",
+      payload: {
+        logs: [
+          { timestamp: "2026-03-01T10:00:15.000Z", level: "info", service: "auth", message: "a" },
+          { timestamp: "2026-03-01T10:00:15.000Z", level: "info", service: "auth", message: "b" },
+          { timestamp: "2026-03-01T10:00:15.000Z", level: "info", service: "auth", message: "c" },
+          { timestamp: "2026-03-01T10:01:00.000Z", level: "error", service: "auth", message: "d" },
+          { timestamp: "2026-03-01T10:01:00.000Z", level: "error", service: "auth", message: "e" },
+          { timestamp: "2026-03-01T10:01:45.000Z", level: "info", service: "checkout", message: "f" },
+        ],
+      },
+    });
+
+    const since = new Date(base.getTime() + 10_000).toISOString();
+    const until = new Date(base.getTime() + 120_000).toISOString();
+    const res = await app.inject({
+      method: "GET",
+      url: `/logs/aggregate?since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}&bucket=1m&group_by=service`,
+    });
+    expect(res.statusCode).toBe(200);
+    const body = res.json() as { buckets: Array<{ start: string; group: string | null; count: number }> };
+    const byKey = new Map(body.buckets.map((b) => [`${b.start}|${b.group}`, b.count]));
+    expect(byKey.get("2026-03-01T10:00:00.000Z|auth")).toBe(3);
+    expect(byKey.get("2026-03-01T10:01:00.000Z|auth")).toBe(2);
+    expect(byKey.get("2026-03-01T10:01:00.000Z|checkout")).toBe(1);
+
+    const byLevel = await app.inject({
+      method: "GET",
+      url: `/logs/aggregate?since=${encodeURIComponent("2026-03-01T10:00:00.000Z")}&until=${encodeURIComponent("2026-03-01T10:02:00.000Z")}&bucket=1m&group_by=level`,
+    });
+    const levelBody = byLevel.json() as { buckets: Array<{ start: string; group: string | null; count: number }> };
+    const levelKey = new Map(levelBody.buckets.map((b) => [`${b.start}|${b.group}`, b.count]));
+    expect(levelKey.get("2026-03-01T10:00:00.000Z|info")).toBe(3);
+    expect(levelKey.get("2026-03-01T10:01:00.000Z|error")).toBe(2);
+    expect(levelKey.get("2026-03-01T10:01:00.000Z|info")).toBe(1);
+
+    const filtered = await app.inject({
+      method: "GET",
+      url: `/logs/aggregate?since=${encodeURIComponent("2026-03-01T10:00:00.000Z")}&until=${encodeURIComponent("2026-03-01T10:02:00.000Z")}&bucket=1m&service=checkout`,
+    });
+    const filteredBody = filtered.json() as { buckets: Array<{ count: number; group: string | null }> };
+    expect(filteredBody.buckets).toEqual([{ start: "2026-03-01T10:01:00.000Z", group: null, count: 1 }]);
   });
 
   it("GET /logs/aggregate rejects invalid params", async () => {

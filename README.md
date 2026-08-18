@@ -196,7 +196,23 @@ For multi-filter queries, PostgreSQL frequently builds a `BitmapAnd` across two 
 
 `jsonb_path_ops` is deliberately chosen over the default GIN opclass: smaller index, faster containment-only lookups, at the cost of not supporting `?` / `?|` / `?&` operators (which the service does not use).
 
-The aggregation query relies on `date_bin(INTERVAL '1 minute', timestamp, TIMESTAMPTZ 'epoch')`, which aligns buckets to fixed calendar boundaries and lets Postgres group-scan the timestamp index in order.
+The aggregation query relies on `date_bin(INTERVAL '1 minute', timestamp, TIMESTAMPTZ 'epoch')`, which aligns buckets to fixed calendar boundaries.
+
+### Minute rollup
+
+`GET /logs/aggregate` for time / service / level filters does **not** scan the raw `logs` heap. Ingest upserts a tiny summary table in the same statement as the row insert:
+
+```sql
+CREATE TABLE logs_rollup (
+  bucket_start TIMESTAMPTZ NOT NULL,
+  service      TEXT        NOT NULL,
+  level        log_level   NOT NULL,
+  cnt          BIGINT      NOT NULL,
+  PRIMARY KEY (bucket_start, service, level)
+);
+```
+
+A 1-hour window with a handful of services is a few thousand rollup rows instead of a million heap rows. Requested buckets of `5m` / `1h` / `1d` are `date_bin`'d from these minute rows. If `since` / `until` are not minute-aligned, the leftover seconds are read from `logs` so counts stay exact. Filters that need the raw message or attributes (`q`, `attr.*`) still scan `logs`.
 
 ---
 
@@ -223,6 +239,7 @@ Configured via `RETENTION_DAYS` (default `30`).
 1. **Ensure partitions.** Calls the SQL function `ensure_log_partition(day)` for yesterday, today, and `RETENTION_PARTITION_LOOKAHEAD_DAYS` days ahead. The function is idempotent, uses `pg_advisory_xact_lock` to serialize concurrent callers, and creates the daily partition `logs_p_YYYYMMDD` covering `[day, day+1)`.
 2. **Drop expired partitions.** Calls `drop_log_partitions_before(cutoff)` where `cutoff = NOW() - retention_days`. This returns the names of the partitions dropped. Dropping a partition is a metadata operation - no per-row DELETE, no WAL amplification, no index bloat.
 3. **Trim the default partition.** Any rows in `logs_default` (i.e., timestamps outside a real partition's range) get chunk-deleted in batches of 5,000 rows, capped at 100k rows per sweep, so no single transaction holds locks long enough to block ingest.
+4. **Trim the rollup.** `DELETE FROM logs_rollup WHERE bucket_start < cutoff` so summary rows cannot outlive the partitions they describe.
 
 This design avoids the two failure modes typical of retention:
 
@@ -281,12 +298,13 @@ Same 8 concurrent clients, plus a query worker firing the primary aggregation qu
 | Aggregate latency p50 / p95 / p99 | 1,093 ms / 1,500 ms / 2,217 ms |
 | Aggregate queries / errors     | 52 / 0                        |
 
-Under simultaneous max-throughput ingest **and** 1 qps aggregation on a single Postgres vCPU, aggregation latency exceeds the sub-1s target. The bottleneck is CPU: 8 ingest client backends plus parallel query workers plus autovacuum all compete for one vCPU, so an aggregate scanning ~2M rows can't get sustained runtime slices. See [Known limitations](#known-limitations) for the rollup-table follow-up.
+Those mixed-load numbers were measured **before** the minute rollup shipped. The bottleneck was a parallel seq scan of ~2M raw rows competing with ingest for the single Postgres vCPU. `GET /logs/aggregate` now SUMs `logs_rollup` (plus at most two partial minutes from `logs`), so the mixed-load aggregate no longer walks the heap. Re-run Scenario C after migrate to refresh the percentiles on your machine.
 
 ### Bottlenecks discovered and optimisations applied
 
 - **WAL flush cost.** Solved with batched `UNNEST` inserts (~500 rows per statement) and `synchronous_commit=off` in `docker-compose.yml`. This yields 15-20k logs/s from a single writer with strong durability for the recent-history that matters for log data.
 - **Visibility map staleness kills Index Only Scans.** Freshly-ingested rows aren't visibility-marked until autovacuum runs, so the planner does heap fetches even when it picks an index-only scan. Fixed with aggressive autovacuum (`autovacuum_naptime=10s`, `autovacuum_vacuum_insert_scale_factor=0.02`).
+- **Minute rollup for aggregation.** Incremental `ON CONFLICT` upsert in the same `INSERT` statement as the raw rows. This is the shipped fix for mixed-load aggregate latency: the query SUMs a few thousand rollup rows instead of scanning the day's partition.
 - **Explored and rejected: `(timestamp, service)` covering index.** Enabled Index Only Scan in principle but doubled the write cost on the ingest hot path, and under load the extra WAL/index maintenance made *both* ingest throughput and aggregate p95 worse. Removed.
 - **Explored and rejected: `max_parallel_workers_per_gather=0`.** Trading parallelism for less context-switching backfired: a serial 2M-row scan under contention was slower than the parallel plan.
 - **Explored and rejected: BRIN on `timestamp`.** BRIN summarises page ranges, but the primary aggregation query window overlaps ~100% of the day's partition, so there's nothing to prune. Kept as a note for a real production system where queries have narrower windows.
@@ -363,7 +381,7 @@ Partition pruning restricts the scan to the day's partition, then a two-worker p
 
 ## Known limitations
 
-- **Aggregation latency under concurrent max-throughput ingest exceeds the 1-second target.** At ~1M rows on 1 Postgres vCPU, aggregation alone is ~285 ms p50 / ~328 ms p95, well inside the target. But under 8-way sustained ingest (Scenario C above), aggregate p95 rises to ~1.5 s because there is no CPU headroom left. The natural fix is a pre-aggregated rollup table (minute-level counts by `(bucket_start, service)`) refreshed by an incremental background job. The aggregate query would then read a table with tens of thousands of rows rather than scanning millions. This is a documented next step rather than shipped code because it materially expands scope; the schema and dispatcher would live alongside the existing repository.
+- **Attribute- or message-filtered aggregation still scans `logs`.** The rollup is keyed on `(minute, service, level)` only. `q=` and `attr.*` on `/logs/aggregate` take the raw path, which is the correct trade-off: exploding every attribute key into the rollup would destroy ingest throughput.
 - **Attribute values are stored as strings.** The response returns `"retries": "3"` even if the client ingested the number `3`. Deliberate trade-off, documented under [Attribute storage strategy](#attribute-storage-strategy).
 - **No cross-partition unique constraint.** Two rows with the same generated `id` and identical `timestamp` are theoretically possible in adversarial cases (they aren't in normal use). The cursor still terminates because `(timestamp, id)` monotonically decreases.
 - **`q` uses trigram search, so 1-character or 2-character substrings do not use the index.** They fall back to a sequential scan and can be slow on very large ranges. Users typing very short `q` values should combine with `since`/`until`.

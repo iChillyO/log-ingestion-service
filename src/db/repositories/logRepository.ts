@@ -3,6 +3,7 @@
 
 import type { Pool } from "pg";
 import { buildWhereClause, type LogFilters } from "../query/buildLogFilters";
+import { canUseRollup, rollupWindow } from "../query/rollup";
 import type { Cursor } from "../../domain/cursor";
 import type { LogLevel, ValidatedLogEntry } from "../../domain/logSchemas";
 
@@ -77,11 +78,26 @@ export class LogRepository {
       attributes[i] = JSON.stringify(e.attributes);
     }
 
+    // One statement, one round trip: insert raw rows and increment the
+    // minute rollup from RETURNING. The CTE is a single transaction, so a
+    // 200 from POST /logs means both the heap and the rollup committed.
     await this.pool.query(
-      `INSERT INTO logs ("timestamp", level, service, message, attributes)
-       SELECT ts::timestamptz, lvl::log_level, svc, msg, attrs::jsonb
-       FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[])
-         AS t(ts, lvl, svc, msg, attrs)`,
+      `WITH ins AS (
+         INSERT INTO logs ("timestamp", level, service, message, attributes)
+         SELECT ts::timestamptz, lvl::log_level, svc, msg, attrs::jsonb
+         FROM UNNEST($1::text[], $2::text[], $3::text[], $4::text[], $5::text[])
+           AS t(ts, lvl, svc, msg, attrs)
+         RETURNING "timestamp", level, service
+       )
+       INSERT INTO logs_rollup (bucket_start, service, level, cnt)
+       SELECT date_bin(INTERVAL '1 minute', "timestamp", TIMESTAMPTZ 'epoch'),
+              service,
+              level,
+              COUNT(*)
+       FROM ins
+       GROUP BY 1, 2, 3
+       ON CONFLICT (bucket_start, service, level)
+       DO UPDATE SET cnt = logs_rollup.cnt + EXCLUDED.cnt`,
       [timestamps, levels, services, messages, attributes],
     );
   }
@@ -120,6 +136,73 @@ export class LogRepository {
   }
 
   async aggregate(opts: AggregateOptions): Promise<AggregateBucket[]> {
+    if (canUseRollup(opts.filters)) {
+      return this.aggregateFromRollup(opts);
+    }
+    return this.aggregateFromRaw(opts);
+  }
+
+  /**
+   * Fast path: SUM pre-aggregated minute counts, then re-bin to the requested
+   * bucket. Partial minutes at the since/until edges are filled from `logs`
+   * so unaligned windows stay exact.
+   */
+  private async aggregateFromRollup(opts: AggregateOptions): Promise<AggregateBucket[]> {
+    const interval = BUCKET_TO_INTERVAL[opts.bucket];
+    const groupCol = opts.groupBy ? GROUP_TO_COLUMN[opts.groupBy] : null;
+    const win = rollupWindow(opts.since, opts.until);
+
+    const params: unknown[] = [
+      win.rollupFrom,
+      win.rollupTo,
+      win.edge1From,
+      win.edge1To,
+      win.edge2From,
+      win.edge2To,
+    ];
+    let filterSql = "";
+    if (opts.filters.service !== undefined) {
+      params.push(opts.filters.service);
+      filterSql += ` AND service = $${params.length}`;
+    }
+    if (opts.filters.level !== undefined) {
+      params.push(opts.filters.level);
+      filterSql += ` AND level = $${params.length}::log_level`;
+    }
+
+    const selectExtra = groupCol ? `, ${groupCol} AS grp` : "";
+    const innerGroup = groupCol ? `, ${groupCol}` : "";
+    const outerGroup = groupCol ? `, grp` : "";
+    const bucketRollup = `date_bin(INTERVAL '${interval}', bucket_start, TIMESTAMPTZ 'epoch')`;
+    const bucketRaw = `date_bin(INTERVAL '${interval}', "timestamp", TIMESTAMPTZ 'epoch')`;
+
+    const sql = `
+      WITH parts AS (
+        SELECT ${bucketRollup} AS bucket_start${selectExtra}, SUM(cnt)::bigint AS cnt
+        FROM logs_rollup
+        WHERE bucket_start >= $1 AND bucket_start < $2
+          ${filterSql}
+        GROUP BY 1${innerGroup}
+        UNION ALL
+        SELECT ${bucketRaw} AS bucket_start${selectExtra}, COUNT(*)::bigint AS cnt
+        FROM logs
+        WHERE (
+          ("timestamp" >= $3 AND "timestamp" < $4)
+          OR ("timestamp" >= $5 AND "timestamp" < $6)
+        )
+          ${filterSql}
+        GROUP BY 1${innerGroup}
+      )
+      SELECT bucket_start${groupCol ? ", grp" : ""}, SUM(cnt)::bigint AS cnt
+      FROM parts
+      GROUP BY bucket_start${outerGroup}
+      ORDER BY bucket_start ASC${outerGroup}
+    `;
+
+    return this.mapAggregateRows(opts.groupBy, sql, params);
+  }
+
+  private async aggregateFromRaw(opts: AggregateOptions): Promise<AggregateBucket[]> {
     const built = buildWhereClause(
       { ...opts.filters, since: opts.since, until: opts.until },
       { includeIngestionCeiling: false },
@@ -149,15 +232,23 @@ export class LogRepository {
       ORDER BY bucket_start ASC${orderExtra}
     `;
 
+    return this.mapAggregateRows(opts.groupBy, sql, built.params);
+  }
+
+  private async mapAggregateRows(
+    groupBy: GroupBy | null,
+    sql: string,
+    params: unknown[],
+  ): Promise<AggregateBucket[]> {
     const { rows } = await this.pool.query<{
       bucket_start: Date;
       grp?: string | null;
       cnt: string;
-    }>(sql, built.params);
+    }>(sql, params);
 
     return rows.map((r) => ({
       start: r.bucket_start,
-      group: opts.groupBy ? (r.grp ?? null) : null,
+      group: groupBy ? (r.grp ?? null) : null,
       count: Number(r.cnt),
     }));
   }

@@ -10,6 +10,8 @@
 //   3. As a safety net, bulk-deletes any rows that ended up in the DEFAULT
 //      partition (out-of-range timestamps) and are now past the cutoff.
 //      Chunked to avoid long-held locks.
+//   4. Deletes expired minute-rollup rows so the summary table cannot outlive
+//      the partitions it describes.
 
 import type { Pool } from "pg";
 
@@ -39,6 +41,7 @@ export class RetentionWorker {
       await this.ensurePartitions();
       await this.dropExpiredPartitions();
       await this.trimDefaultPartition();
+      await this.trimRollup();
     } catch (err) {
       this.log("retention sweep failed", { error: (err as Error).message });
     } finally {
@@ -105,5 +108,10 @@ export class RetentionWorker {
       );
       if ((result.rowCount ?? 0) < CHUNK) break;
     }
+  }
+
+  private async trimRollup(): Promise<void> {
+    const cutoff = new Date(Date.now() - this.opts.retentionDays * 24 * 60 * 60 * 1000);
+    await this.pool.query("DELETE FROM logs_rollup WHERE bucket_start < $1", [cutoff.toISOString()]);
   }
 }
