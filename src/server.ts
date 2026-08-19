@@ -3,13 +3,15 @@ import { createPool } from "./db/pool";
 import { runMigrations } from "./db/migrator";
 import { RetentionWorker } from "./retention/retentionWorker";
 import { buildApp } from "./app";
+import { LogRepository } from "./db/repositories/logRepository";
 
 async function main(): Promise<void> {
   const config = loadConfig();
   const pool = createPool(config);
+  const repo = new LogRepository(pool);
 
   let ready = false;
-  const app = buildApp({ config, pool, isReady: () => ready });
+  const app = buildApp({ config, pool, repo, isReady: () => ready });
 
   // Start listening BEFORE migrations complete so /health can report
   // "starting" (503) rather than the socket being closed. The contract only
@@ -41,6 +43,12 @@ async function main(): Promise<void> {
     app.log.info(`received ${signal}, shutting down`);
     ready = false;
     retention.stop();
+    try {
+      // Flush any buffered writes before closing connections
+      await repo.flushPendingWrites();
+    } catch (err) {
+      app.log.warn({ err }, "error flushing pending writes");
+    }
     try {
       await app.close();
     } catch (err) {

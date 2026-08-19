@@ -1,7 +1,7 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import type { Pool } from "pg";
 import type { AppConfig } from "./config/env";
-import { LogRepository } from "./db/repositories/logRepository";
+import type { LogRepository } from "./db/repositories/logRepository";
 import { healthRoutes } from "./http/health";
 import { ingestRoutes } from "./http/logsIngest";
 import { queryRoutes } from "./http/logsQuery";
@@ -11,6 +11,7 @@ import { BadRequestError, ForbiddenError, UnauthorizedError } from "./http/error
 export interface AppDeps {
   config: AppConfig;
   pool: Pool;
+  repo: LogRepository;
   isReady: () => boolean;
 }
 
@@ -27,7 +28,7 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     disableRequestLogging: true,
   });
 
-  const repo = new LogRepository(deps.pool);
+  const repo = deps.repo;
 
   app.setErrorHandler((err, req, reply) => {
     if (err instanceof BadRequestError) {

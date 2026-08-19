@@ -11,6 +11,7 @@ import { runMigrations } from "../src/db/migrator";
 import { buildApp } from "../src/app";
 import { loadConfig } from "../src/config/env";
 import { RetentionWorker } from "../src/retention/retentionWorker";
+import { LogRepository } from "../src/db/repositories/logRepository";
 
 const dbUrl = process.env.TEST_DATABASE_URL;
 const suite = dbUrl ? describe : describe.skip;
@@ -18,6 +19,7 @@ const suite = dbUrl ? describe : describe.skip;
 suite("contract (integration)", () => {
   let pool: Pool;
   let app: FastifyInstance;
+  let repo: LogRepository;
 
   beforeAll(async () => {
     process.env.DATABASE_URL = dbUrl!;
@@ -38,7 +40,8 @@ suite("contract (integration)", () => {
       partitionLookaheadDays: config.retentionPartitionLookaheadDays,
     });
     await retention.runOnce();
-    app = buildApp({ config, pool, isReady: () => true });
+    repo = new LogRepository(pool);
+    app = buildApp({ config, pool, repo, isReady: () => true });
     await app.ready();
   });
 

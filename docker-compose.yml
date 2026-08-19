@@ -6,8 +6,6 @@ services:
       POSTGRES_USER: logs
       POSTGRES_PASSWORD: logs
       POSTGRES_DB: logs
-      # Tuned for ~1 GB RAM container. shared_buffers ~25% of RAM,
-      # effective_cache_size ~50%, work_mem sized for aggregation queries.
       POSTGRES_INITDB_ARGS: "--data-checksums"
     command:
       - "postgres"
@@ -16,7 +14,7 @@ services:
       - "-c"
       - "effective_cache_size=512MB"
       - "-c"
-      - "work_mem=32MB"
+      - "work_mem=8MB"
       - "-c"
       - "maintenance_work_mem=128MB"
       - "-c"
@@ -24,27 +22,49 @@ services:
       - "-c"
       - "synchronous_commit=off"
       - "-c"
-      - "max_wal_size=1GB"
+      - "max_wal_size=2GB"
       - "-c"
-      - "min_wal_size=128MB"
+      - "min_wal_size=256MB"
       - "-c"
       - "checkpoint_completion_target=0.9"
       - "-c"
       - "random_page_cost=1.1"
       - "-c"
-      - "max_connections=100"
+      - "max_connections=200"
       - "-c"
       - "jit=off"
-      # Aggressive autovacuum on the logs partitions - fresh rows have to be
-      # visibility-marked promptly so aggregation queries can use an Index
-      # Only Scan without heap fetches. Retention drops old partitions so
-      # wraparound risk is nil.
       - "-c"
-      - "autovacuum_vacuum_scale_factor=0.02"
+      - "wal_level=minimal"
       - "-c"
-      - "autovacuum_vacuum_insert_scale_factor=0.02"
+      - "max_wal_senders=0"
       - "-c"
-      - "autovacuum_naptime=10s"
+      - "fsync=on"
+      - "-c"
+      - "commit_delay=500"
+      - "-c"
+      - "commit_siblings=3"
+      - "-c"
+      - "wal_writer_delay=100ms"
+      - "-c"
+      - "wal_buffers=64MB"
+      - "-c"
+      - "log_min_messages=error"
+      - "-c"
+      - "log_min_error_statement=error"
+      - "-c"
+      - "autovacuum_vacuum_scale_factor=0.05"
+      - "-c"
+      - "autovacuum_vacuum_insert_scale_factor=0.05"
+      - "-c"
+      - "autovacuum_naptime=30s"
+      - "-c"
+      - "full_page_writes=off"
+      - "-c"
+      - "checkpoint_timeout=15min"
+      - "-c"
+      - "effective_io_concurrency=200"
+      - "-c"
+      - "huge_pages=off"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U logs -d logs"]
       interval: 2s
@@ -69,13 +89,15 @@ services:
       NODE_ENV: production
       PORT: 8080
       DATABASE_URL: postgres://logs:logs@postgres:5432/logs
-      LOG_LEVEL: info
-      INGEST_MAX_BATCH: "1000"
-      INGEST_MAX_BODY_BYTES: "5242880"
+      LOG_LEVEL: warn
+      INGEST_MAX_BATCH: "10000"
+      INGEST_MAX_BODY_BYTES: "10485760"
       RETENTION_DAYS: "30"
       RETENTION_SWEEP_INTERVAL_MS: "300000"
       RETENTION_PARTITION_LOOKAHEAD_DAYS: "2"
       AUTH_ENABLED: "false"
+      UV_THREADPOOL_SIZE: "4"
+      NODE_OPTIONS: "--max-old-space-size=200"
     ports:
       - "8080:8080"
     healthcheck:

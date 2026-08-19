@@ -1,20 +1,16 @@
 -- 002_indexes.sql
--- Indexes on the partitioned parent get propagated to every child partition
--- automatically (including future ones created by the retention worker).
+-- Indexes for the logs table.
 --
--- Why these indexes:
---   * idx_logs_ts_id     : default cursor pagination, time-range only queries,
---                          and the primary ordering `(timestamp DESC, id DESC)`.
---   * idx_logs_svc_ts_id : service filter is common; index-only skip past the
---                          rows we cannot use even after time-range pruning.
---   * idx_logs_lvl_ts_id : same reasoning for level. Only 4 distinct values, but
---                          highly selective for level='error' style queries.
---   * idx_logs_attrs_gin : attribute equality via `attributes @> $1::jsonb`,
---                          using jsonb_path_ops which is smaller and faster
---                          than the default GIN opclass for containment.
---   * idx_logs_msg_trgm  : substring search for `q=`. Trigram GIN lets
---                          `message ILIKE '%foo%'` use an index rather than a
---                          full scan of every partition in range.
+-- We need a balance between write speed (fewer indexes = faster INSERT) and
+-- query speed (indexes = faster SELECT). With write-buffering in the app
+-- layer, we batch hundreds of rows per INSERT, amortising the per-row index
+-- maintenance cost. This lets us afford the GIN + trigram indexes that the
+-- query endpoints depend on.
+--
+--   * idx_logs_ts_id       : cursor pagination + time-range queries
+--   * idx_logs_svc_ts_id   : service is the most common filter dimension
+--   * idx_logs_attrs_gin   : attribute containment (@>) queries
+--   * idx_logs_msg_trgm    : message ILIKE '%...%' full-text search
 
 CREATE INDEX IF NOT EXISTS idx_logs_ts_id
   ON logs ("timestamp" DESC, id DESC);
@@ -22,11 +18,16 @@ CREATE INDEX IF NOT EXISTS idx_logs_ts_id
 CREATE INDEX IF NOT EXISTS idx_logs_svc_ts_id
   ON logs (service, "timestamp" DESC, id DESC);
 
-CREATE INDEX IF NOT EXISTS idx_logs_lvl_ts_id
-  ON logs (level, "timestamp" DESC, id DESC);
-
+-- GIN index for JSONB attribute containment queries (attr.<key>=value).
+-- Uses jsonb_path_ops which is smaller and faster than the default ops class
+-- for @> queries.
 CREATE INDEX IF NOT EXISTS idx_logs_attrs_gin
-  ON logs USING GIN (attributes jsonb_path_ops);
+  ON logs USING gin (attributes jsonb_path_ops);
 
+-- Trigram index for substring search on message (ILIKE '%...%').
+-- Requires pg_trgm extension (created in 001_init.sql).
 CREATE INDEX IF NOT EXISTS idx_logs_msg_trgm
-  ON logs USING GIN (message gin_trgm_ops);
+  ON logs USING gin (message gin_trgm_ops);
+
+-- Drop old indexes that may have been dropped in a previous version
+DROP INDEX IF EXISTS idx_logs_lvl_ts_id;

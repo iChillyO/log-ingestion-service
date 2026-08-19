@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS logs (
   attributes   JSONB       NOT NULL DEFAULT '{}'::jsonb
 ) PARTITION BY RANGE ("timestamp");
 
-CREATE SEQUENCE IF NOT EXISTS logs_id_seq AS BIGINT START WITH 1 CACHE 200;
+CREATE SEQUENCE IF NOT EXISTS logs_id_seq AS BIGINT START WITH 1 CACHE 1000;
 
 -- Make id auto-populate from the shared sequence unless the caller supplies one.
 ALTER TABLE logs
