@@ -1,7 +1,8 @@
 // Persistence layer for logs. All SQL construction happens here (and in
 // buildLogFilters). HTTP handlers should never see raw SQL.
 
-import type { Pool } from "pg";
+import type { Pool, PoolClient } from "pg";
+import { from as copyFrom } from "pg-copy-streams";
 import { buildWhereClause, type LogFilters } from "../query/buildLogFilters";
 import { canUseRollup, rollupWindow } from "../query/rollup";
 import type { Cursor } from "../../domain/cursor";
@@ -55,10 +56,10 @@ export interface QueryOptions {
 // Write buffer configuration.
 //
 // The single biggest perf win: coalesce many small HTTP batches (each 30-50
-// rows) into fewer, larger Postgres INSERTs.  At 15k logs/s arriving as
+// rows) into fewer, larger Postgres writes.  At 15k logs/s arriving as
 // ~300-500 requests/s, each individual INSERT has fixed planning + WAL
-// overhead.  Buffering reduces INSERT frequency to ~50/s with 300+ row arrays
-// which cuts Postgres CPU by 5-8x.
+// overhead.  Buffering reduces write frequency to ~30/s with 500+ row arrays
+// which cuts Postgres CPU dramatically.
 //
 // Safety: the HTTP handler `await repo.insertMany(...)` does NOT resolve until
 // the batch has been flushed to Postgres, so 200 is never returned to the
@@ -71,8 +72,18 @@ interface BufferEntry {
   reject: (err: Error) => void;
 }
 
-const FLUSH_INTERVAL_MS = 15;    // flush at most every 15ms — keeps p95 < 30ms
-const FLUSH_MAX_SIZE   = 5_000;  // flush immediately when we have this many rows
+const FLUSH_INTERVAL_MS = 20;    // flush at most every 20ms
+const FLUSH_MAX_SIZE   = 8_000;  // flush immediately when we have this many rows
+
+// COPY TEXT format escaping: backslash, tab, newline, carriage return
+// Use a regex to detect if escaping is needed (branch prediction friendly)
+const NEEDS_ESCAPE = /[\\\t\n\r]/;
+function escapeCopyValue(s: string): string {
+  if (!NEEDS_ESCAPE.test(s)) return s;
+  return s.replace(/\\/g, "\\\\").replace(/\t/g, "\\t").replace(/\n/g, "\\n").replace(/\r/g, "\\r");
+}
+
+const COPY_SQL = `COPY logs ("timestamp", level, service, message, attributes) FROM STDIN WITH (FORMAT text)`;
 
 export class LogRepository {
   private rollupQueue: Map<string, number> = new Map();
@@ -83,6 +94,10 @@ export class LogRepository {
   private bufferCount = 0;
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private flushing = false;
+
+  // Dedicated connection for COPY writes — avoids pool checkout overhead
+  // and keeps the connection warm with pg's internal caches.
+  private copyClient: PoolClient | null = null;
 
   constructor(private readonly pool: Pool) {}
 
@@ -135,11 +150,17 @@ export class LogRepository {
     }
 
     try {
-      await this.insertDirect(allEntries);
+      await this.insertViaCopy(allEntries);
       for (const b of batch) b.resolve();
     } catch (err) {
-      const error = err instanceof Error ? err : new Error(String(err));
-      for (const b of batch) b.reject(error);
+      // If COPY fails, try UNNEST fallback once
+      try {
+        await this.insertDirect(allEntries);
+        for (const b of batch) b.resolve();
+      } catch (err2) {
+        const error = err2 instanceof Error ? err2 : new Error(String(err2));
+        for (const b of batch) b.reject(error);
+      }
     } finally {
       this.flushing = false;
       if (this.buffer.length > 0) {
@@ -149,7 +170,66 @@ export class LogRepository {
   }
 
   // -----------------------------------------------------------------------
-  // insertDirect — actual DB write using UNNEST bulk insert.
+  // Get or create a dedicated COPY client from the pool.
+  // -----------------------------------------------------------------------
+  private async getCopyClient(): Promise<PoolClient> {
+    if (this.copyClient) return this.copyClient;
+    const client = await this.pool.connect();
+    this.copyClient = client;
+    // If the dedicated client errors out, release it so next flush gets a new one.
+    client.on("error", () => {
+      this.copyClient = null;
+      try { client.release(true); } catch { /* ignore */ }
+    });
+    return client;
+  }
+
+  // -----------------------------------------------------------------------
+  // insertViaCopy — actual DB write using COPY protocol.
+  // COPY is 2-5x faster than INSERT with UNNEST because it bypasses the
+  // SQL parser, planner, and executor overhead entirely.
+  // -----------------------------------------------------------------------
+  private async insertViaCopy(entries: ValidatedLogEntry[]): Promise<void> {
+    if (entries.length === 0) return;
+
+    let client: PoolClient;
+    try {
+      client = await this.getCopyClient();
+    } catch {
+      // Fallback to pool if dedicated client fails
+      return this.insertDirect(entries);
+    }
+
+    try {
+      // Build the COPY data as a single string buffer for efficiency.
+      const parts: string[] = new Array(entries.length);
+      for (let i = 0; i < entries.length; i++) {
+        const e = entries[i]!;
+        parts[i] = `${e.timestamp.toISOString()}\t${e.level}\t${escapeCopyValue(e.service)}\t${escapeCopyValue(e.message)}\t${escapeCopyValue(JSON.stringify(e.attributes))}`;
+      }
+      const data = parts.join("\n") + "\n";
+
+      const copyStream = client.query(copyFrom(COPY_SQL));
+
+      // Direct write+end is faster than pipeline for a single buffer —
+      // avoids Readable creation and stream machinery overhead.
+      await new Promise<void>((resolve, reject) => {
+        copyStream.on("error", reject);
+        copyStream.on("finish", resolve);
+        copyStream.end(data);
+      });
+
+      this.enqueueRollup(entries);
+    } catch (err) {
+      // Release the broken client and null it out
+      this.copyClient = null;
+      try { client.release(true); } catch { /* ignore */ }
+      throw err;
+    }
+  }
+
+  // -----------------------------------------------------------------------
+  // Fallback INSERT via UNNEST — used if COPY fails
   // -----------------------------------------------------------------------
   private async insertDirect(entries: ValidatedLogEntry[]): Promise<void> {
     if (entries.length === 0) return;
@@ -183,15 +263,15 @@ export class LogRepository {
 
   // -----------------------------------------------------------------------
   // Rollup helpers — accumulate minute-level counts and flush periodically.
-  // Delay is longer than the write buffer (100ms vs 15ms) because rollup
+  // Delay is longer than the write buffer (200ms vs 20ms) because rollup
   // is less latency-sensitive and we want to coalesce more.
+  // Uses ms-based keys to avoid Date object creation on the hot path.
   // -----------------------------------------------------------------------
   private enqueueRollup(entries: ValidatedLogEntry[]): void {
     for (const e of entries) {
-      const bucket = new Date(
-        Math.floor(e.timestamp.getTime() / 60_000) * 60_000,
-      ).toISOString();
-      const key = `${bucket}\t${e.service}\t${e.level}`;
+      // Use milliseconds as the bucket key to avoid Date/toISOString per row
+      const bucketMs = Math.floor(e.timestamp.getTime() / 60_000) * 60_000;
+      const key = `${bucketMs}\t${e.service}\t${e.level}`;
       this.rollupQueue.set(key, (this.rollupQueue.get(key) ?? 0) + 1);
     }
     if (!this.rollupTimer) {
@@ -211,7 +291,7 @@ export class LogRepository {
     const counts: number[] = [];
     for (const [key, cnt] of q) {
       const [b, s, l] = key.split("\t");
-      buckets.push(b!);
+      buckets.push(new Date(Number(b!)).toISOString());
       services.push(s!);
       levels.push(l!);
       counts.push(cnt);
@@ -251,6 +331,11 @@ export class LogRepository {
     }
     await this.flushBuffer();
     await this.flushPendingRollup();
+    // Release the dedicated COPY client
+    if (this.copyClient) {
+      try { this.copyClient.release(); } catch { /* ignore */ }
+      this.copyClient = null;
+    }
   }
 
   // -----------------------------------------------------------------------

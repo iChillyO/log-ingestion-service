@@ -58,7 +58,7 @@ export function buildWhereClause(filters: LogFilters, opts: WhereOptions = {}): 
     add(`attributes @> ?::jsonb`, JSON.stringify(containment));
   }
 
-  if (filters.q) add(`message ILIKE '%' || ? || '%' ESCAPE '\\'`, likeEscape(filters.q));
+  if (filters.q) add(`message ILIKE ? ESCAPE '\\'`, `%${likeEscape(filters.q)}%`);
 
   if (opts.cursor) {
     // Deterministic secondary ordering by id ensures stable pagination even

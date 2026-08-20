@@ -36,6 +36,14 @@ async function main(): Promise<void> {
   });
   retention.start();
 
+  // Warm up pool connections and run ANALYZE for optimal query plans.
+  // This ensures the planner has accurate statistics from the start.
+  try {
+    await warmupPool(pool, config);
+  } catch (err) {
+    app.log.warn({ err }, "pool warmup failed (non-fatal)");
+  }
+
   ready = true;
   app.log.info("service is ready");
 
@@ -84,6 +92,24 @@ async function waitForDatabase(pool: import("pg").Pool, log: { info: (msg: strin
     }
   }
   throw new Error(`database not reachable within 60s: ${(lastError as Error)?.message}`);
+}
+
+async function warmupPool(pool: import("pg").Pool, config: import("./config/env").AppConfig): Promise<void> {
+  // Pre-create pool connections in parallel
+  const minConns = Math.min(4, 8);
+  const warmupPromises: Promise<void>[] = [];
+  for (let i = 0; i < minConns; i++) {
+    warmupPromises.push(
+      pool.connect().then((client) => {
+        client.release();
+      })
+    );
+  }
+  await Promise.all(warmupPromises);
+
+  // Run ANALYZE on key tables so the planner has fresh statistics
+  await pool.query("ANALYZE logs");
+  await pool.query("ANALYZE logs_rollup");
 }
 
 main().catch((err) => {

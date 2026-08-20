@@ -30,6 +30,14 @@ CREATE TABLE IF NOT EXISTS logs_rollup (
   PRIMARY KEY (bucket_start, service, level)
 );
 
+-- Index for filtered rollup queries (service= filter on aggregate)
+CREATE INDEX IF NOT EXISTS idx_rollup_svc_bucket
+  ON logs_rollup (service, bucket_start);
+
+-- Index for filtered rollup queries (level= filter on aggregate)
+CREATE INDEX IF NOT EXISTS idx_rollup_lvl_bucket
+  ON logs_rollup (level, bucket_start);
+
 -- Backfill existing rows so a running database stays consistent after migrate.
 INSERT INTO logs_rollup (bucket_start, service, level, cnt)
 SELECT date_bin(INTERVAL '1 minute', "timestamp", TIMESTAMPTZ 'epoch'),
