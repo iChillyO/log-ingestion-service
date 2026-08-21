@@ -8,7 +8,8 @@
 //     --duration 60 \
 //     --batch 500 \
 //     --concurrency 8 \
-//     --query-rate 1
+//     --query-rate 1 \
+//     --query-mix true
 
 interface Args {
   url: string;
@@ -18,6 +19,7 @@ interface Args {
   queryRatePerSec: number;
   targetRatePerSec: number; // 0 = drive at max speed (open loop)
   services: string[];
+  queryMix: boolean; // rotate through every query shape, not just the aggregate
 }
 
 function parseArgs(): Args {
@@ -43,6 +45,7 @@ function parseArgs(): Args {
     queryRatePerSec: Number.parseFloat(opts["query-rate"] ?? "1"),
     targetRatePerSec: Number.parseFloat(opts["target-rate"] ?? "0"),
     services: (opts.services ?? "auth,checkout,orders,catalog,payments,gateway").split(","),
+    queryMix: opts["query-mix"] === "true",
   };
 }
 
@@ -124,23 +127,85 @@ async function ingestLoop(
   }
 }
 
-async function queryLoop(
-  args: Args,
-  stop: { at: number },
-  stats: { count: number; errors: number; hist: Histogram },
-): Promise<void> {
+// The brief asks for query latency percentiles, not just ingest throughput,
+// and the interesting cases are the ones that cannot use an ordered btree
+// scan. Each shape is timed separately so a single slow path shows up instead
+// of being averaged away by the fast ones.
+interface QueryShape {
+  name: string;
+  build: (args: Args) => string;
+}
+
+const at = (offsetMs: number) => encodeURIComponent(new Date(Date.now() + offsetMs).toISOString());
+const pick = <T,>(xs: readonly T[]): T => xs[Math.floor(Math.random() * xs.length)]!;
+
+const QUERY_SHAPES: QueryShape[] = [
+  {
+    // The "primary aggregation query" the brief names: 1-hour window, 1m
+    // buckets, grouped by service. Served from the minute rollup tier.
+    name: "aggregate 1h/1m by service",
+    build: (a) =>
+      `${a.url}/logs/aggregate?since=${at(-3600_000)}&until=${at(60_000)}&bucket=1m&group_by=service`,
+  },
+  {
+    // Month-wide, hourly buckets. This is what the hourly rollup tier exists
+    // for; from the minute tier alone it would have to sum ~1M rows.
+    name: "aggregate 30d/1h by level",
+    build: (a) =>
+      `${a.url}/logs/aggregate?since=${at(-30 * 24 * 3600_000)}&until=${at(60_000)}&bucket=1h&group_by=level`,
+  },
+  {
+    name: "list service+level",
+    build: (a) => `${a.url}/logs?service=${pick(a.services)}&level=error&limit=100`,
+  },
+  {
+    // GIN-backed with no `since` - exercises the time-window probe ladder
+    // against a filter that matches almost nothing.
+    name: "list attr (high card)",
+    build: (a) => `${a.url}/logs?attr.user_id=${Math.floor(Math.random() * 100_000)}&limit=100`,
+  },
+  {
+    // Same path, but a filter that matches ~25% of rows.
+    name: "list attr (low card)",
+    build: (a) => `${a.url}/logs?attr.region=${pick(REGIONS)}&limit=100`,
+  },
+  {
+    name: "list q substring",
+    build: (a) => `${a.url}/logs?q=declined&limit=100`,
+  },
+  {
+    name: "list q+attr+service",
+    build: (a) =>
+      `${a.url}/logs?q=declined&attr.region=${pick(REGIONS)}&service=${pick(a.services)}&limit=100`,
+  },
+];
+
+interface QueryStats {
+  count: number;
+  errors: number;
+  hist: Histogram;
+  perShape: Map<string, Histogram>;
+}
+
+async function queryLoop(args: Args, stop: { at: number }, stats: QueryStats): Promise<void> {
   if (args.queryRatePerSec <= 0) return;
   const intervalMs = 1000 / args.queryRatePerSec;
+  const shapes = args.queryMix ? QUERY_SHAPES : [QUERY_SHAPES[0]!];
+  let i = 0;
   while (Date.now() < stop.at) {
     const start = Date.now();
-    const since = new Date(Date.now() - 60 * 60_000).toISOString();
-    const until = new Date(Date.now() + 60_000).toISOString();
-    const url = `${args.url}/logs/aggregate?since=${encodeURIComponent(since)}&until=${encodeURIComponent(until)}&bucket=1m&group_by=service`;
+    const shape = shapes[i++ % shapes.length]!;
     const t0 = performance.now();
     try {
-      const res = await fetch(url);
+      const res = await fetch(shape.build(args));
       const dt = performance.now() - t0;
       stats.hist.add(dt);
+      let perShape = stats.perShape.get(shape.name);
+      if (!perShape) {
+        perShape = new Histogram();
+        stats.perShape.set(shape.name, perShape);
+      }
+      perShape.add(dt);
       stats.count++;
       if (!res.ok) stats.errors++;
       else await res.arrayBuffer();
@@ -156,7 +221,12 @@ async function main(): Promise<void> {
   const args = parseArgs();
   const stop = { at: Date.now() + args.durationSec * 1000 };
   const ingestStats = { accepted: 0, rejected: 0, requests: 0, errors: 0, hist: new Histogram() };
-  const queryStats = { count: 0, errors: 0, hist: new Histogram() };
+  const queryStats: QueryStats = {
+    count: 0,
+    errors: 0,
+    hist: new Histogram(),
+    perShape: new Map(),
+  };
 
   // Wait for /health.
   const readyDeadline = Date.now() + 60_000;
@@ -187,9 +257,20 @@ async function main(): Promise<void> {
   console.log(`throughput=${ingestRate.toFixed(1)} logs/s`);
   console.log(`batch latency ms: p50=${ingestStats.hist.percentile(50).toFixed(1)} p95=${ingestStats.hist.percentile(95).toFixed(1)} p99=${ingestStats.hist.percentile(99).toFixed(1)}`);
 
-  console.log("\n=== aggregate query ===");
+  console.log("\n=== queries ===");
   console.log(`queries=${queryStats.count} errors=${queryStats.errors}`);
-  console.log(`latency ms: p50=${queryStats.hist.percentile(50).toFixed(1)} p95=${queryStats.hist.percentile(95).toFixed(1)} p99=${queryStats.hist.percentile(99).toFixed(1)}`);
+  console.log(
+    `overall latency ms: p50=${queryStats.hist.percentile(50).toFixed(1)} p95=${queryStats.hist.percentile(95).toFixed(1)} p99=${queryStats.hist.percentile(99).toFixed(1)}`,
+  );
+  if (queryStats.perShape.size > 1) {
+    console.log(`\n${"per-shape latency ms".padEnd(28)} ${"n".padStart(5)} ${"p50".padStart(8)} ${"p95".padStart(8)} ${"p99".padStart(8)}`);
+    for (const [name, h] of queryStats.perShape) {
+      console.log(
+        `  ${name.padEnd(26)} ${String(h.count()).padStart(5)} ` +
+          `${h.percentile(50).toFixed(1).padStart(8)} ${h.percentile(95).toFixed(1).padStart(8)} ${h.percentile(99).toFixed(1).padStart(8)}`,
+      );
+    }
+  }
 }
 
 main().catch((err) => {
