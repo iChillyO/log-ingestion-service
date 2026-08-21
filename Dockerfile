@@ -1,4 +1,4 @@
-# syntax=docker/dockerfile:1.7
+
 
 FROM node:22-alpine AS deps
 WORKDIR /app
@@ -11,7 +11,7 @@ COPY package.json package-lock.json* ./
 RUN npm ci --ignore-scripts
 COPY tsconfig.json ./
 COPY src ./src
-RUN npx tsc -p tsconfig.json
+RUN npm run build
 
 FROM node:22-alpine AS runtime
 WORKDIR /app
