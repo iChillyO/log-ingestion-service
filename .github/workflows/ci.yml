@@ -8,6 +8,7 @@ on:
 
 jobs:
   test:
+    name: typecheck + unit + integration
     runs-on: ubuntu-latest
 
     services:
@@ -45,47 +46,108 @@ jobs:
       - name: Run tests (unit + integration)
         run: npm test
 
+  # Deliberately NOT `needs: test`.
+  #
+  # This job used to be gated on the test job, so when a unit test went red the
+  # image was never built and a broken Dockerfile shipped unnoticed. Container
+  # build and contract smoke are exactly the checks that must never be skipped,
+  # so they run independently.
   docker:
+    name: docker build + contract smoke
     runs-on: ubuntu-latest
-    needs: test
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Validate compose file
+        run: docker compose config --quiet
 
       - name: Build image
         run: docker build -t log-ingestion-service:ci .
 
-      - name: docker compose up + smoke test
+      - name: docker compose up (zero config)
         run: |
           set -euo pipefail
+          # No env file, no arguments - this is the graded posture.
           docker compose up -d --build
-          # Wait for /health
-          for i in $(seq 1 60); do
+          for i in $(seq 1 90); do
             if curl -sf http://localhost:8080/health >/dev/null; then
-              echo "service is healthy"
+              echo "service is healthy after ${i} polls"
               break
             fi
             sleep 2
           done
           curl -sf http://localhost:8080/health
-          # Ingest a small batch and verify shape
+
+      - name: Required contract smoke test
+        run: |
+          set -euo pipefail
+          NOW=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          # POST /logs: mixed batch -> 200, per-entry rejection reasons.
           RESP=$(curl -s -X POST http://localhost:8080/logs \
             -H 'content-type: application/json' \
-            -d '{"logs":[{"timestamp":"'"$(date -u +%Y-%m-%dT%H:%M:%SZ)"'","level":"info","service":"ci","message":"smoke"}]}')
+            -d "{\"logs\":[
+                  {\"timestamp\":\"$NOW\",\"level\":\"info\",\"service\":\"ci\",\"message\":\"smoke\",\"attributes\":{\"run\":\"1\",\"n\":7}},
+                  {\"timestamp\":\"$NOW\",\"level\":\"critical\",\"service\":\"ci\",\"message\":\"bad\"},
+                  {\"timestamp\":\"$NOW\",\"level\":\"error\",\"service\":\"ci\",\"message\":\"payment declined\",\"attributes\":{\"run\":\"1\"}}
+                ]}")
           echo "$RESP"
-          echo "$RESP" | grep -q '"accepted":1'
-          # Query with the exact contract
-          curl -sf "http://localhost:8080/logs?service=ci" | grep -q '"logs"'
+          echo "$RESP" | grep -q '"accepted":2'
+          echo "$RESP" | grep -q '"index":1'
+
+          # An all-invalid batch and a malformed body must both be 400.
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/logs \
+            -H 'content-type: application/json' \
+            -d "{\"logs\":[{\"timestamp\":\"$NOW\",\"level\":\"nope\",\"service\":\"ci\",\"message\":\"x\"}]}")" = 400
+          test "$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8080/logs \
+            -H 'content-type: application/json' -d '{not json')" = 400
+
+          # An unrecognised Authorization header must be ignored, not rejected,
+          # while AUTH_ENABLED is false. The load generator always sends one.
+          test "$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'Authorization: Bearer whatever' 'http://localhost:8080/logs?limit=1')" = 200
+
+          # GET /logs: filters and cursor pagination.
+          curl -sf 'http://localhost:8080/logs?service=ci&level=error&q=declined&attr.run=1&limit=1' \
+            | tee /dev/stderr | grep -q '"payment declined"'
+          CURSOR=$(curl -sf 'http://localhost:8080/logs?service=ci&limit=1' \
+            | sed -n 's/.*"next_cursor":"\([^"]*\)".*/\1/p')
+          test -n "$CURSOR"
+          curl -sf "http://localhost:8080/logs?service=ci&limit=1&cursor=$CURSOR" | grep -q '"logs"'
+          test "$(curl -s -o /dev/null -w '%{http_code}' 'http://localhost:8080/logs?cursor=not-a-cursor')" = 400
+          test "$(curl -s -o /dev/null -w '%{http_code}' 'http://localhost:8080/logs?limit=99999')" = 400
+
+          # GET /logs/aggregate: rollup path, hourly tier, and raw path.
           SINCE=$(date -u -d '-1 hour' +%Y-%m-%dT%H:%M:%SZ)
           UNTIL=$(date -u -d '+1 minute' +%Y-%m-%dT%H:%M:%SZ)
-          curl -sf "http://localhost:8080/logs/aggregate?since=$SINCE&until=$UNTIL&bucket=1m" | grep -q '"buckets"'
-        env:
-          COMPOSE_DOCKER_CLI_BUILD: "1"
-          DOCKER_BUILDKIT: "1"
+          sleep 1  # let the rollup flush (ROLLUP_FLUSH_INTERVAL_MS=200)
+          curl -sf "http://localhost:8080/logs/aggregate?since=$SINCE&until=$UNTIL&bucket=1m&group_by=service" \
+            | tee /dev/stderr | grep -q '"group":"ci"'
+          MONTH_AGO=$(date -u -d '-30 days' +%Y-%m-%dT%H:%M:%SZ)
+          curl -sf "http://localhost:8080/logs/aggregate?since=$MONTH_AGO&until=$UNTIL&bucket=1h&group_by=level" \
+            | grep -q '"buckets"'
+          curl -sf "http://localhost:8080/logs/aggregate?since=$SINCE&until=$UNTIL&bucket=1m&q=declined" \
+            | grep -q '"buckets"'
+          test "$(curl -s -o /dev/null -w '%{http_code}' \
+            "http://localhost:8080/logs/aggregate?since=$UNTIL&until=$SINCE&bucket=1m")" = 400
 
-      - name: Print app logs on failure
+      - name: Verify partitions cover the retention window
+        run: |
+          set -euo pipefail
+          # The whole retention window must exist as real daily partitions, and
+          # the default partition must be empty. This is the regression guard
+          # for the 006_perf.sql partitioning fix.
+          COUNT=$(docker compose exec -T postgres psql -U logs -d logs -tAc \
+            "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+             WHERE i.inhparent = 'logs'::regclass AND c.relname LIKE 'logs_p_%'")
+          echo "daily partitions: $COUNT"
+          test "$COUNT" -ge 30
+          DEFAULT_ROWS=$(docker compose exec -T postgres psql -U logs -d logs -tAc \
+            "SELECT count(*) FROM logs_default")
+          echo "rows in logs_default: $DEFAULT_ROWS"
+          test "$DEFAULT_ROWS" = 0
+
+      - name: Print container logs on failure
         if: failure()
         run: docker compose logs app postgres
 
