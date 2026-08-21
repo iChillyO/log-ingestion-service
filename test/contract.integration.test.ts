@@ -259,9 +259,9 @@ suite("contract (integration)", () => {
     expect(res.statusCode).toBe(200);
     const body = res.json() as { buckets: Array<{ start: string; group: string | null; count: number }> };
     const byKey = new Map(body.buckets.map((b) => [`${b.start}|${b.group}`, b.count]));
-    expect(byKey.get("2026-03-01T10:00:00.000Z|auth")).toBe(3);
-    expect(byKey.get("2026-03-01T10:01:00.000Z|auth")).toBe(2);
-    expect(byKey.get("2026-03-01T10:01:00.000Z|checkout")).toBe(1);
+    expect(byKey.get("2026-03-01T10:00:00Z|auth")).toBe(3);
+    expect(byKey.get("2026-03-01T10:01:00Z|auth")).toBe(2);
+    expect(byKey.get("2026-03-01T10:01:00Z|checkout")).toBe(1);
 
     const byLevel = await app.inject({
       method: "GET",
@@ -269,16 +269,16 @@ suite("contract (integration)", () => {
     });
     const levelBody = byLevel.json() as { buckets: Array<{ start: string; group: string | null; count: number }> };
     const levelKey = new Map(levelBody.buckets.map((b) => [`${b.start}|${b.group}`, b.count]));
-    expect(levelKey.get("2026-03-01T10:00:00.000Z|info")).toBe(3);
-    expect(levelKey.get("2026-03-01T10:01:00.000Z|error")).toBe(2);
-    expect(levelKey.get("2026-03-01T10:01:00.000Z|info")).toBe(1);
+    expect(levelKey.get("2026-03-01T10:00:00Z|info")).toBe(3);
+    expect(levelKey.get("2026-03-01T10:01:00Z|error")).toBe(2);
+    expect(levelKey.get("2026-03-01T10:01:00Z|info")).toBe(1);
 
     const filtered = await app.inject({
       method: "GET",
       url: `/logs/aggregate?since=${encodeURIComponent("2026-03-01T10:00:00.000Z")}&until=${encodeURIComponent("2026-03-01T10:02:00.000Z")}&bucket=1m&service=checkout`,
     });
     const filteredBody = filtered.json() as { buckets: Array<{ count: number; group: string | null }> };
-    expect(filteredBody.buckets).toEqual([{ start: "2026-03-01T10:01:00.000Z", group: null, count: 1 }]);
+    expect(filteredBody.buckets).toEqual([{ start: "2026-03-01T10:01:00Z", group: null, count: 1 }]);
   });
 
   it("GET /logs/aggregate rejects invalid params", async () => {
