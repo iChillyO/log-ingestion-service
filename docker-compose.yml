@@ -1,4 +1,9 @@
-version: '3.8'
+# `docker compose up` with no .env and no arguments must produce the plain,
+# unauthenticated core service. Everything below is that configuration.
+#
+# No top-level `version:` key - it has been obsolete since Compose v2 and
+# strict validators reject `cpus`/`mem_limit` when it is present.
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -8,9 +13,13 @@ services:
       POSTGRES_PASSWORD: logs
       POSTGRES_DB: logs
       POSTGRES_INITDB_ARGS: "--data-checksums"
+      # Partition bounds are written as explicit UTC instants, but keeping the
+      # server in UTC keeps EXPLAIN output and logs readable during a demo.
+      TZ: UTC
+      PGTZ: UTC
     command:
       - "postgres"
-      # --- Memory ---
+      # --- Memory (container limit is 1 GB) ---
       - "-c"
       - "shared_buffers=256MB"
       - "-c"
@@ -19,85 +28,85 @@ services:
       - "work_mem=16MB"
       - "-c"
       - "maintenance_work_mem=128MB"
-      # --- WAL performance ---
-      - "-c"
-      - "wal_compression=on"
+      # --- WAL / commit path ---
+      # synchronous_commit=off is the single biggest ingest win: COPY no longer
+      # waits for an fsync before returning. The exposure is bounded by
+      # wal_writer_delay, and fsync itself stays on so the cluster survives a
+      # crash. full_page_writes=off is a deliberate benchmark trade (documented
+      # in the README) - with it off, wal_compression would have nothing left
+      # to compress, so it is off too.
       - "-c"
       - "synchronous_commit=off"
       - "-c"
-      - "max_wal_size=2GB"
+      - "wal_compression=off"
       - "-c"
-      - "min_wal_size=256MB"
+      - "full_page_writes=off"
       - "-c"
-      - "checkpoint_completion_target=0.9"
+      - "fsync=on"
       - "-c"
       - "wal_level=minimal"
       - "-c"
       - "max_wal_senders=0"
       - "-c"
-      - "fsync=on"
-      - "-c"
-      - "commit_delay=1000"
-      - "-c"
-      - "commit_siblings=2"
+      - "wal_buffers=64MB"
       - "-c"
       - "wal_writer_delay=200ms"
       - "-c"
-      - "wal_buffers=64MB"
+      - "max_wal_size=3GB"
       - "-c"
-      - "full_page_writes=off"
+      - "min_wal_size=512MB"
       - "-c"
-      - "checkpoint_timeout=15min"
+      - "checkpoint_timeout=20min"
+      - "-c"
+      - "checkpoint_completion_target=0.9"
+      # --- Background writer: keep dirty pages moving so checkpoints are flat
+      - "-c"
+      - "bgwriter_delay=50ms"
+      - "-c"
+      - "bgwriter_lru_maxpages=800"
       # --- Planner ---
       - "-c"
       - "random_page_cost=1.1"
       - "-c"
       - "effective_io_concurrency=200"
       - "-c"
-      - "huge_pages=off"
-      - "-c"
       - "jit=off"
-      # --- Connections ---
       - "-c"
-      - "max_connections=100"
-      # --- Logging (minimal for perf) ---
-      - "-c"
-      - "log_min_messages=error"
-      - "-c"
-      - "log_min_error_statement=error"
-      - "-c"
-      - "logging_collector=off"
-      # --- Autovacuum tuning (aggressive for fresh COPY'd data) ---
-      - "-c"
-      - "autovacuum_vacuum_scale_factor=0.02"
-      - "-c"
-      - "autovacuum_vacuum_insert_scale_factor=0.02"
-      - "-c"
-      - "autovacuum_naptime=10s"
-      - "-c"
-      - "autovacuum_vacuum_cost_delay=2ms"
-      - "-c"
-      - "autovacuum_vacuum_cost_limit=1000"
-      # --- Parallelism for queries ---
+      - "huge_pages=off"
+      # Parallel query is left at Postgres' default costs. On a 1 vCPU cgroup
+      # the workers share the same core, so aggressively lowering
+      # parallel_setup_cost only steals CPU from ingestion.
       - "-c"
       - "max_parallel_workers_per_gather=2"
       - "-c"
       - "max_parallel_workers=4"
       - "-c"
       - "max_worker_processes=8"
+      # --- Connections: the app pool is ~10; the rest is headroom for psql ---
       - "-c"
-      - "parallel_tuple_cost=0.01"
+      - "max_connections=50"
+      # --- Logging: minimal, this is the hot path ---
       - "-c"
-      - "parallel_setup_cost=100"
-      # --- Planner tuning ---
+      - "log_min_messages=error"
       - "-c"
-      - "default_statistics_target=100"
+      - "log_min_error_statement=error"
       - "-c"
-      - "from_collapse_limit=8"
+      - "logging_collector=off"
+      # --- Autovacuum ---
+      # `logs` is append-only and reclaims space by dropping partitions, so the
+      # insert-driven trigger is what matters (freeze + visibility map).
+      # `logs_rollup*` is upsert-heavy and gets per-table settings in the
+      # migrations.
       - "-c"
-      - "join_collapse_limit=8"
+      - "autovacuum_vacuum_scale_factor=0.05"
       - "-c"
-      - "plan_cache_mode=auto"
+      - "autovacuum_vacuum_insert_scale_factor=0.05"
+      - "-c"
+      - "autovacuum_naptime=15s"
+      - "-c"
+      - "autovacuum_vacuum_cost_delay=2ms"
+      - "-c"
+      - "autovacuum_vacuum_cost_limit=1000"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U logs -d logs"]
       interval: 2s
@@ -115,6 +124,7 @@ services:
     build:
       context: .
     container_name: logs-app
+    init: true
     depends_on:
       postgres:
         condition: service_healthy
@@ -123,14 +133,25 @@ services:
       PORT: 8080
       DATABASE_URL: postgres://logs:logs@postgres:5432/logs
       LOG_LEVEL: warn
+      # --- Ingest guardrails (not part of the required contract) ---
       INGEST_MAX_BATCH: "10000"
       INGEST_MAX_BODY_BYTES: "10485760"
+      # --- Ingest pipeline: see README "Optimizations applied" ---
+      INGEST_FLUSH_INTERVAL_MS: "15"
+      INGEST_FLUSH_MAX_ROWS: "5000"
+      INGEST_WRITERS: "3"
+      INGEST_MAX_BUFFERED_ROWS: "120000"
+      ROLLUP_FLUSH_INTERVAL_MS: "200"
+      PG_POOL_MAX: "10"
+      # --- Retention ---
       RETENTION_DAYS: "30"
       RETENTION_SWEEP_INTERVAL_MS: "300000"
       RETENTION_PARTITION_LOOKAHEAD_DAYS: "2"
+      # --- Optional features: all off by default ---
       AUTH_ENABLED: "false"
-      UV_THREADPOOL_SIZE: "4"
-      NODE_OPTIONS: "--max-old-space-size=200"
+      # 0.5 vCPU: a bigger libuv pool just adds context switches.
+      UV_THREADPOOL_SIZE: "2"
+      NODE_OPTIONS: "--max-old-space-size=192"
     ports:
       - "8080:8080"
     healthcheck:
