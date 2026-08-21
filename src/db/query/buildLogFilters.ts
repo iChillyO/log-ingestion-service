@@ -28,7 +28,6 @@ function likeEscape(value: string): string {
 }
 
 export interface WhereOptions {
-  includeIngestionCeiling?: boolean; // caps `timestamp <= now` for stable snapshots
   cursor?: Cursor | null;
 }
 
@@ -64,10 +63,6 @@ export function buildWhereClause(filters: LogFilters, opts: WhereOptions = {}): 
     // Deterministic secondary ordering by id ensures stable pagination even
     // when many rows share the same timestamp.
     add(`("timestamp", id) < (?, ?::bigint)`, new Date(opts.cursor.t), opts.cursor.i);
-  }
-
-  if (opts.includeIngestionCeiling) {
-    add(`"timestamp" <= NOW() + INTERVAL '5 minutes'`);
   }
 
   if (clauses.length === 0) return { clause: "", params };

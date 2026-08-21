@@ -1,7 +1,7 @@
 import type { FastifyPluginAsync } from "fastify";
-import type { LogRepository } from "../db/repositories/logRepository";
+import { IngestOverloadedError, type LogRepository } from "../db/repositories/logRepository";
 import { validateBatch } from "../domain/logSchemas";
-import { BadRequestError } from "./errors";
+import { BadRequestError, ServiceUnavailableError } from "./errors";
 
 export interface IngestDeps {
   repo: LogRepository;
@@ -44,6 +44,9 @@ export const ingestRoutes = (deps: IngestDeps): FastifyPluginAsync => {
       } catch (err) {
         // Bubble up so the Fastify error handler emits a JSON error and
         // (critically) the caller does NOT treat this batch as accepted.
+        if (err instanceof IngestOverloadedError) {
+          throw new ServiceUnavailableError(err.message, err.retryAfterSeconds);
+        }
         req.log.error({ err }, "insert failed");
         throw err;
       }

@@ -28,10 +28,12 @@ suite("contract (integration)", () => {
     // Fresh schema per run so tests are deterministic.
     await pool.query(`DROP TABLE IF EXISTS logs CASCADE`);
     await pool.query(`DROP TABLE IF EXISTS logs_rollup CASCADE`);
+    await pool.query(`DROP TABLE IF EXISTS logs_rollup_hour CASCADE`);
     await pool.query(`DROP TABLE IF EXISTS schema_migrations CASCADE`);
     await pool.query(`DROP TYPE IF EXISTS log_level CASCADE`);
     await pool.query(`DROP SEQUENCE IF EXISTS logs_id_seq CASCADE`);
     await pool.query(`DROP FUNCTION IF EXISTS ensure_log_partition(DATE)`);
+    await pool.query(`DROP FUNCTION IF EXISTS ensure_log_partitions(DATE, DATE)`);
     await pool.query(`DROP FUNCTION IF EXISTS drop_log_partitions_before(TIMESTAMPTZ)`);
     await runMigrations(pool);
     const retention = new RetentionWorker(pool, {
@@ -194,6 +196,10 @@ suite("contract (integration)", () => {
         ],
       },
     });
+    // The rollup is written on a short timer; force it so the assertion below
+    // is deterministic instead of racing that timer.
+    await repo.flushPendingRollup();
+
     const since = new Date(base.getTime() - 300_000).toISOString();
     const until = new Date(base.getTime() + 60_000).toISOString();
     const res = await app.inject({
@@ -213,6 +219,7 @@ suite("contract (integration)", () => {
   });
 
   it("GET /logs/aggregate with no group_by has null group", async () => {
+    await repo.flushPendingRollup();
     const since = new Date(Date.now() - 3_600_000).toISOString();
     const until = new Date(Date.now() + 60_000).toISOString();
     const res = await app.inject({
@@ -240,6 +247,8 @@ suite("contract (integration)", () => {
         ],
       },
     });
+
+    await repo.flushPendingRollup();
 
     const since = new Date(base.getTime() + 10_000).toISOString();
     const until = new Date(base.getTime() + 120_000).toISOString();

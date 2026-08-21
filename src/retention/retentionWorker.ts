@@ -1,10 +1,19 @@
 // Background retention worker.
 //
 // Runs on an interval and:
-//   1. Ensures partitions exist for today, yesterday, and the next
-//      `partitionLookaheadDays` days so ingestion always has a home partition
-//      even when the local clock crosses midnight or a client back-dates a
-//      timestamp by a small margin.
+//   1. Ensures a daily partition exists for every day inside the retention
+//      window, plus `partitionLookaheadDays` into the future.
+//
+//      Covering the WHOLE window (not just today +/- a day) is the single
+//      most important thing this worker does. A backfilled dataset spanning a
+//      month would otherwise land almost entirely in `logs_default`, which
+//      costs twice:
+//        * queries lose partition pruning and scan one undivided heap;
+//        * `CREATE TABLE ... PARTITION OF` has to take ACCESS EXCLUSIVE on the
+//          parent and scan the default partition to prove no row conflicts, so
+//          every later sweep stalls ingestion for as long as that scan takes.
+//      Creating the window up front, while `logs_default` is still empty,
+//      makes both problems disappear.
 //   2. Drops partitions whose upper bound is <= `now - retentionDays`. This is
 //      metadata-only and takes negligible time compared to a bulk DELETE.
 //   3. As a safety net, bulk-deletes any rows that ended up in the DEFAULT
@@ -49,11 +58,12 @@ export class RetentionWorker {
     }
   }
 
+  /**
+   * Begin periodic sweeps. The caller is expected to `await runOnce()` first,
+   * before reporting the service healthy, so this only schedules the interval.
+   */
   start(): void {
     if (this.timer) return;
-    // Run one sweep immediately (fire-and-forget) so partitions for today are
-    // guaranteed to exist before the first request lands.
-    void this.runOnce();
     this.timer = setInterval(() => {
       void this.runOnce();
     }, this.opts.sweepIntervalMs);
@@ -69,16 +79,24 @@ export class RetentionWorker {
   }
 
   private async ensurePartitions(): Promise<void> {
-    const days: string[] = [];
     const now = new Date();
-    // Include yesterday so back-dated logs land in a real partition, not the
-    // default one.
-    for (let d = -1; d <= this.opts.partitionLookaheadDays; d++) {
-      const dt = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + d));
-      days.push(dt.toISOString().slice(0, 10));
-    }
-    for (const day of days) {
-      await this.pool.query("SELECT ensure_log_partition($1::date)", [day]);
+    const utcDay = (offset: number): string =>
+      new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + offset))
+        .toISOString()
+        .slice(0, 10);
+
+    // One round trip creates every missing day in the window. Days that
+    // already exist are skipped inside the function, so steady-state sweeps
+    // create at most one new partition.
+    const from = utcDay(-this.opts.retentionDays);
+    const to = utcDay(this.opts.partitionLookaheadDays);
+    const { rows } = await this.pool.query<{ ensure_log_partitions: number }>(
+      "SELECT ensure_log_partitions($1::date, $2::date)",
+      [from, to],
+    );
+    const created = rows[0]?.ensure_log_partitions ?? 0;
+    if (created > 0) {
+      this.log("created partitions", { count: created, from, to });
     }
   }
 

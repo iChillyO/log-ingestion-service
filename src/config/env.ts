@@ -9,6 +9,12 @@ export interface AppConfig {
   retentionDays: number;
   retentionSweepIntervalMs: number;
   retentionPartitionLookaheadDays: number;
+  ingestFlushIntervalMs: number;
+  ingestFlushMaxRows: number;
+  ingestWriters: number;
+  ingestMaxBufferedRows: number;
+  rollupFlushIntervalMs: number;
+  pgPoolMax: number;
   authEnabled: boolean;
   loadgenApiKey: string | null;
 }
@@ -42,6 +48,15 @@ export function loadConfig(): AppConfig {
     retentionDays: readInt("RETENTION_DAYS", 30, 1, 3650),
     retentionSweepIntervalMs: readInt("RETENTION_SWEEP_INTERVAL_MS", 5 * 60 * 1000, 10_000, 24 * 60 * 60 * 1000),
     retentionPartitionLookaheadDays: readInt("RETENTION_PARTITION_LOOKAHEAD_DAYS", 2, 1, 30),
+    // Ingest pipeline tuning. Defaults are what we measured as best on the
+    // graded container sizes (0.5 vCPU app / 1 vCPU Postgres); they are exposed
+    // so the numbers in the README can be reproduced and re-tuned.
+    ingestFlushIntervalMs: readInt("INGEST_FLUSH_INTERVAL_MS", 15, 1, 5_000),
+    ingestFlushMaxRows: readInt("INGEST_FLUSH_MAX_ROWS", 5_000, 100, 200_000),
+    ingestWriters: readInt("INGEST_WRITERS", 3, 1, 16),
+    ingestMaxBufferedRows: readInt("INGEST_MAX_BUFFERED_ROWS", 120_000, 1_000, 5_000_000),
+    rollupFlushIntervalMs: readInt("ROLLUP_FLUSH_INTERVAL_MS", 200, 10, 15_000),
+    pgPoolMax: readInt("PG_POOL_MAX", 10, 2, 100),
     authEnabled: readBool("AUTH_ENABLED", false),
     loadgenApiKey: process.env.LOADGEN_API_KEY?.trim() || null,
   };

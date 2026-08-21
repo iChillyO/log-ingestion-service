@@ -104,3 +104,23 @@ describe("validateBatch", () => {
     expect(rejected).toEqual([{ index: 1, reason: `invalid level: "bogus"` }]);
   });
 });
+
+describe("NUL rejection", () => {
+  const base = {
+    timestamp: "2026-07-20T14:32:01Z",
+    level: "info",
+    service: "svc",
+    message: "hello",
+  };
+
+  it("rejects a NUL in message, service or an attribute value", () => {
+    expect(String(validateLogEntry({ ...base, message: "a\u0000b" }))).toContain("NUL");
+    expect(String(validateLogEntry({ ...base, service: "a\u0000b" }))).toContain("NUL");
+    expect(String(validateLogEntry({ ...base, attributes: { k: "a\u0000b" } }))).toContain("NUL");
+  });
+
+  it("still accepts the tabs and newlines that COPY escapes", () => {
+    const result = validateLogEntry({ ...base, message: "line1\nline2\tcol\end" });
+    expect(typeof result).not.toBe("string");
+  });
+});

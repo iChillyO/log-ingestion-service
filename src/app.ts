@@ -6,7 +6,12 @@ import { healthRoutes } from "./http/health";
 import { ingestRoutes } from "./http/logsIngest";
 import { queryRoutes } from "./http/logsQuery";
 import { aggregateRoutes } from "./http/logsAggregate";
-import { BadRequestError, ForbiddenError, UnauthorizedError } from "./http/errors";
+import {
+  BadRequestError,
+  ForbiddenError,
+  ServiceUnavailableError,
+  UnauthorizedError,
+} from "./http/errors";
 
 export interface AppDeps {
   config: AppConfig;
@@ -41,6 +46,11 @@ export function buildApp(deps: AppDeps): FastifyInstance {
     }
     if (err instanceof ForbiddenError) {
       reply.status(403).send({ error: err.message });
+      return;
+    }
+    if (err instanceof ServiceUnavailableError) {
+      reply.header("Retry-After", String(err.retryAfterSeconds));
+      reply.status(503).send({ error: err.message });
       return;
     }
     // Fastify's built-in validation error path (e.g. body too large, malformed

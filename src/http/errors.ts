@@ -24,3 +24,19 @@ export class ForbiddenError extends Error {
     this.name = "ForbiddenError";
   }
 }
+
+/**
+ * Backpressure. The brief is explicit that shedding load with 503 + Retry-After
+ * beats crashing, and that a 200 must never be returned for a batch we have not
+ * durably accepted.
+ */
+export class ServiceUnavailableError extends Error {
+  readonly statusCode = 503;
+  constructor(
+    message = "service temporarily unable to accept writes",
+    readonly retryAfterSeconds = 1,
+  ) {
+    super(message);
+    this.name = "ServiceUnavailableError";
+  }
+}

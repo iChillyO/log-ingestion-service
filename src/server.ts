@@ -8,7 +8,13 @@ import { LogRepository } from "./db/repositories/logRepository";
 async function main(): Promise<void> {
   const config = loadConfig();
   const pool = createPool(config);
-  const repo = new LogRepository(pool);
+  const repo = new LogRepository(pool, {
+    flushIntervalMs: config.ingestFlushIntervalMs,
+    flushMaxRows: config.ingestFlushMaxRows,
+    writers: config.ingestWriters,
+    maxBufferedRows: config.ingestMaxBufferedRows,
+    rollupFlushIntervalMs: config.rollupFlushIntervalMs,
+  });
 
   let ready = false;
   const app = buildApp({ config, pool, repo, isReady: () => ready });
@@ -34,6 +40,20 @@ async function main(): Promise<void> {
     partitionLookaheadDays: config.retentionPartitionLookaheadDays,
     log: (msg, meta) => app.log.info(meta ?? {}, msg),
   });
+
+  // Await the first sweep instead of firing it off in the background. It
+  // materialises the whole retention window of daily partitions, and doing
+  // that while `logs_default` is empty is the difference between an instant
+  // metadata-only CREATE TABLE and one that has to scan the default partition
+  // under ACCESS EXCLUSIVE. We must not report healthy - and start taking
+  // writes - until the partitions those writes belong in exist.
+  try {
+    await retention.runOnce();
+  } catch (err) {
+    app.log.error({ err }, "initial retention sweep failed");
+    await app.close();
+    process.exit(1);
+  }
   retention.start();
 
   // Warm up pool connections and run ANALYZE for optimal query plans.
@@ -96,7 +116,7 @@ async function waitForDatabase(pool: import("pg").Pool, log: { info: (msg: strin
 
 async function warmupPool(pool: import("pg").Pool, config: import("./config/env").AppConfig): Promise<void> {
   // Pre-create pool connections in parallel
-  const minConns = Math.min(4, 8);
+  const minConns = Math.min(config.ingestWriters + 2, config.pgPoolMax);
   const warmupPromises: Promise<void>[] = [];
   for (let i = 0; i < minConns; i++) {
     warmupPromises.push(
@@ -110,6 +130,7 @@ async function warmupPool(pool: import("pg").Pool, config: import("./config/env"
   // Run ANALYZE on key tables so the planner has fresh statistics
   await pool.query("ANALYZE logs");
   await pool.query("ANALYZE logs_rollup");
+  await pool.query("ANALYZE logs_rollup_hour");
 }
 
 main().catch((err) => {

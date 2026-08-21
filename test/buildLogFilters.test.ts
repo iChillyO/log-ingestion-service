@@ -18,7 +18,6 @@ describe("buildWhereClause", () => {
         until: new Date("2026-07-20T15:00:00Z"),
         q: "declined",
       },
-      { includeIngestionCeiling: true },
     );
     // Ensure every placeholder is unique and dense: $1..$N.
     const matches = built.clause.match(/\$\d+/g) ?? [];
@@ -30,7 +29,6 @@ describe("buildWhereClause", () => {
     expect(built.clause).toContain("level = ");
     expect(built.clause).toContain("attributes @>");
     expect(built.clause).toContain("message ILIKE");
-    expect(built.clause).toContain("NOW() + INTERVAL '5 minutes'");
   });
 
   it("adds cursor tuple comparison", () => {
@@ -50,6 +48,9 @@ describe("buildWhereClause", () => {
 
   it("escapes ILIKE metacharacters in q", () => {
     const built = buildWhereClause({ attributes: {}, q: "100%_bug" });
-    expect(built.params[0]).toBe("100\\%\\_bug");
+    // The wildcards that surround the term are ours; the ones inside the
+    // user's text are escaped so ILIKE matches them literally.
+    expect(built.params[0]).toBe("%100\\%\\_bug%");
+    expect(built.clause).toContain("ESCAPE");
   });
 });
