@@ -20,7 +20,7 @@ export const aggregateRoutes = (deps: AggregateDeps): FastifyPluginAsync => {
       });
       return {
         buckets: buckets.map((b) => ({
-          start: b.start.toISOString(),
+          start: b.start.toISOString().replace(/\.000Z$/, "Z"),
           group: b.group,
           count: b.count,
         })),
