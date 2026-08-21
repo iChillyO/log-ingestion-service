@@ -575,6 +575,10 @@ export class LogRepository {
   // -----------------------------------------------------------------------
 
   async aggregate(opts: AggregateOptions): Promise<AggregateBucket[]> {
+    // Ensure all pending minute-level counts are written to logs_rollup
+    // before we query it, guaranteeing read-after-write consistency.
+    await this.flushPendingRollup();
+
     if (canUseRollup(opts.filters)) {
       return this.aggregateFromRollup(opts);
     }
