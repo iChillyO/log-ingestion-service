@@ -25,7 +25,7 @@ services:
       - "-c"
       - "effective_cache_size=768MB"
       - "-c"
-      - "work_mem=16MB"
+      - "work_mem=4MB"
       - "-c"
       - "maintenance_work_mem=128MB"
       # --- WAL / commit path ---
@@ -48,7 +48,7 @@ services:
       - "-c"
       - "max_wal_senders=0"
       - "-c"
-      - "wal_buffers=64MB"
+      - "wal_buffers=16MB"
       - "-c"
       - "wal_writer_delay=200ms"
       - "-c"
@@ -77,7 +77,7 @@ services:
       # the workers share the same core, so aggressively lowering
       # parallel_setup_cost only steals CPU from ingestion.
       - "-c"
-      - "max_parallel_workers_per_gather=2"
+      - "max_parallel_workers_per_gather=0"
       - "-c"
       - "max_parallel_workers=4"
       - "-c"

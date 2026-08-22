@@ -282,15 +282,20 @@ export class LogRepository {
     }
 
     try {
+      let rollupMap: Map<string, number> | null = null;
       try {
-        await this.insertViaCopy(allEntries);
+        rollupMap = await this.insertViaCopy(allEntries);
       } catch {
         // COPY can fail for reasons that a plain INSERT survives (a broken
         // connection mid-stream, most often). Retry once on the pool before
         // giving up on the batch.
         await this.insertDirect(allEntries);
       }
-      this.enqueueRollup(allEntries);
+      if (rollupMap) {
+        this.enqueueRollupMap(rollupMap);
+      } else {
+        this.enqueueRollup(allEntries);
+      }
       for (const b of batch) b.resolve();
     } catch (err) {
       const error = err instanceof Error ? err : new Error(String(err));
@@ -331,19 +336,27 @@ export class LogRepository {
    * COPY is 2-5x cheaper than a parameterised INSERT for bulk writes: it skips
    * the parser, planner and executor entirely and streams straight into the
    * heap.
+   *
+   * Returns the pre-accumulated rollup map so the caller can enqueue it without
+   * a second pass over the entries.
    */
-  private async insertViaCopy(entries: ValidatedLogEntry[]): Promise<void> {
-    if (entries.length === 0) return;
+  private async insertViaCopy(entries: ValidatedLogEntry[]): Promise<Map<string, number> | null> {
+    if (entries.length === 0) return null;
 
     const client = await this.acquireCopyClient();
     let broken = false;
     try {
       const parts: string[] = new Array(entries.length);
+      const rollupMap = new Map<string, number>();
       for (let i = 0; i < entries.length; i++) {
         const e = entries[i]!;
         parts[i] =
           `${e.tsText}\t${e.level}\t${escapeCopyValue(e.service)}\t` +
-          `${escapeCopyValue(e.message)}\t${escapeCopyValue(JSON.stringify(e.attributes))}`;
+          `${escapeCopyValue(e.message)}\t${escapeCopyValue(e.attributesJson)}`;
+        // Accumulate rollup counts in the same loop to avoid a second pass.
+        const bucketMs = Math.floor(e.tsMs / 60_000) * 60_000;
+        const key = `${bucketMs}\t${e.service}\t${e.level}`;
+        rollupMap.set(key, (rollupMap.get(key) ?? 0) + 1);
       }
       const data = parts.join("\n") + "\n";
 
@@ -355,6 +368,8 @@ export class LogRepository {
         // syscall-sized buffer.
         copyStream.end(data);
       });
+
+      return rollupMap;
     } catch (err) {
       broken = true;
       throw err;
@@ -380,7 +395,7 @@ export class LogRepository {
       levels[i] = e.level;
       services[i] = e.service;
       messages[i] = e.message;
-      attributes[i] = JSON.stringify(e.attributes);
+      attributes[i] = e.attributesJson;
     }
 
     await this.pool.query(
@@ -407,6 +422,15 @@ export class LogRepository {
       const bucketMs = Math.floor(e.tsMs / 60_000) * 60_000;
       const key = `${bucketMs}\t${e.service}\t${e.level}`;
       q.set(key, (q.get(key) ?? 0) + 1);
+    }
+    this.scheduleRollupFlush();
+  }
+
+  /** Merge a pre-accumulated rollup map (built during COPY serialization). */
+  private enqueueRollupMap(map: Map<string, number>): void {
+    const q = this.rollupQueue;
+    for (const [key, cnt] of map) {
+      q.set(key, (q.get(key) ?? 0) + cnt);
     }
     this.scheduleRollupFlush();
   }
@@ -575,10 +599,6 @@ export class LogRepository {
   // -----------------------------------------------------------------------
 
   async aggregate(opts: AggregateOptions): Promise<AggregateBucket[]> {
-    // Ensure all pending minute-level counts are written to logs_rollup
-    // before we query it, guaranteeing read-after-write consistency.
-    await this.flushPendingRollup();
-
     if (canUseRollup(opts.filters)) {
       return this.aggregateFromRollup(opts);
     }
@@ -632,15 +652,24 @@ export class LogRepository {
     });
 
     const outerGroup = groupCol ? ", grp" : "";
-    const sql = `
-      WITH parts AS (
-        ${branches.join("\n        UNION ALL\n        ")}
-      )
-      SELECT bucket_start${outerGroup}, SUM(cnt)::bigint AS cnt
-      FROM parts
-      GROUP BY bucket_start${outerGroup}
-      ORDER BY bucket_start ASC${outerGroup}
-    `;
+
+    let sql: string;
+    if (branches.length === 1) {
+      // Single segment: skip the CTE wrapper. The inner query already produces
+      // the final result, so no outer GROUP BY + SUM is needed.
+      sql = `${branches[0]}
+             ORDER BY bucket_start ASC${outerGroup}`;
+    } else {
+      sql = `
+        WITH parts AS (
+          ${branches.join("\n        UNION ALL\n        ")}
+        )
+        SELECT bucket_start${outerGroup}, SUM(cnt)::bigint AS cnt
+        FROM parts
+        GROUP BY bucket_start${outerGroup}
+        ORDER BY bucket_start ASC${outerGroup}
+      `;
+    }
 
     return this.mapAggregateRows(opts.groupBy, sql, params);
   }
