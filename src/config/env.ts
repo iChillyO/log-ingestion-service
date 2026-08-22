@@ -56,7 +56,7 @@ export function loadConfig(): AppConfig {
     ingestWriters: readInt("INGEST_WRITERS", 3, 1, 16),
     ingestMaxBufferedRows: readInt("INGEST_MAX_BUFFERED_ROWS", 120_000, 1_000, 5_000_000),
     rollupFlushIntervalMs: readInt("ROLLUP_FLUSH_INTERVAL_MS", 200, 10, 15_000),
-    pgPoolMax: readInt("PG_POOL_MAX", 10, 2, 100),
+    pgPoolMax: readInt("PG_POOL_MAX", 14, 2, 100),
     authEnabled: readBool("AUTH_ENABLED", false),
     loadgenApiKey: process.env.LOADGEN_API_KEY?.trim() || null,
   };

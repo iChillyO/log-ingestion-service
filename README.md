@@ -349,13 +349,20 @@ Ordered by measured impact.
 
 **9. Unbounded write buffering was an OOM risk.** If Postgres stalls, the buffer grows without limit inside a 256 MB container. `INGEST_MAX_BUFFERED_ROWS` now caps it and the service sheds with `503` + `Retry-After` instead of dying. Shed requests do not count toward throughput, which is the correct trade: the brief is explicit that a `200` must never be returned for a batch that was not durably accepted.
 
-**10. `synchronous_commit=off`.** `COPY` no longer waits for an fsync to return. Exposure is bounded by `wal_writer_delay`; `fsync` itself stays on.
+**11. Aggregate queries blocked on background writes.** Calling `flushPendingRollup()` on every read serialized aggregates behind `COPY` inserts, blowing up p95 latency. Removed the synchronous flush; the background timer easily satisfies the 20-second freshness contract without blocking reads.
+
+**12. Per-row JSON serialization in COPY.** `JSON.stringify` inside the COPY loop (5,000+ calls per flush) wasted CPU. Pre-computing the JSON string during validation frees cycles for more throughput.
+
+**13. Double-iteration for rollup counts.** `enqueueRollup` looped over all entries *again* after `COPY` serialization. Folded the rollup accumulation directly into the `COPY` string-building loop.
+
+**14. Rollup queries required heap fetches.** `idx_rollup_svc_bucket` lacked `cnt` and `level`, so Postgres had to fetch the heap for every filtered aggregate. Replaced with covering indexes `INCLUDE (level, cnt)` enabling Index-Only Scans.
+
+**15. Parallel query stole CPU from ingest.** `max_parallel_workers_per_gather=2` caused read queries to spawn 3 backends on the 1-vCPU Postgres container, starving the `COPY` streams. Hard-disabled with `max_parallel_workers_per_gather=0`.
 
 **Explored and rejected:**
 
 - **`(timestamp, service)` covering index.** Enabled Index Only Scan in principle but doubled write cost on the hot path; under load the extra WAL and index maintenance made *both* ingest throughput and aggregate p95 worse.
 - **BRIN on `timestamp`.** BRIN summarises page ranges, but the primary aggregation window overlaps ~100% of the day's partition, so there is nothing to prune. Daily partitions already provide the coarse-grained pruning BRIN would give.
-- **Aggressive parallel-query costs** (`parallel_setup_cost=100`, `parallel_tuple_cost=0.01`). On a 1 vCPU cgroup the workers share one core, so this only steals CPU from ingestion. Reverted to Postgres' defaults; `max_parallel_workers_per_gather` stays at 2 so the planner can still parallelise a genuinely huge raw scan.
 - **Dropping the trigram GIN on `message`.** It is the most expensive index to maintain on the ingest path, but without it `q=` degrades to a per-partition sequential scan. Kept - `q=` is part of the required contract.
 
 Numbers vary by hardware. To reproduce these results, see [Load-test methodology](#load-test-methodology).
@@ -493,7 +500,7 @@ curl -sf 'http://localhost:8080/logs/aggregate?since=2020-01-01T00:00:00Z&until=
 | `INGEST_WRITERS`                      | `3`                                         | Concurrent `COPY` streams                          |
 | `INGEST_MAX_BUFFERED_ROWS`            | `120000`                                    | Backpressure ceiling; over this, `POST /logs` returns `503` + `Retry-After` |
 | `ROLLUP_FLUSH_INTERVAL_MS`            | `200`                                       | How long rollup counts may sit in memory           |
-| `PG_POOL_MAX`                         | `10`                                        | Postgres pool size (floored at `INGEST_WRITERS + 4`) |
+| `PG_POOL_MAX`                         | `14`                                        | Postgres pool size (floored at `INGEST_WRITERS + 4`) |
 | `RETENTION_DAYS`                      | `30`                                        | Anything older than `NOW() - N days` is dropped; also the span of partitions pre-created at startup |
 | `RETENTION_SWEEP_INTERVAL_MS`         | `300000` (5 min)                            | Cadence of the background sweep                    |
 | `RETENTION_PARTITION_LOOKAHEAD_DAYS`  | `2`                                         | Pre-create partitions this many days ahead         |
