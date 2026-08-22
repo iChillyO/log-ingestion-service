@@ -4,7 +4,7 @@
 import type { Pool, PoolClient } from "pg";
 import { from as copyFrom } from "pg-copy-streams";
 import { buildWhereClause, type LogFilters } from "../query/buildLogFilters";
-import { canUseRollup, planRollupSegments, type RollupSource } from "../query/rollup";
+import { canUseRollup, planRollupSegments, type RollupSegment, type RollupSource } from "../query/rollup";
 import type { Cursor } from "../../domain/cursor";
 import type { LogLevel, ValidatedLogEntry } from "../../domain/logSchemas";
 
@@ -600,9 +600,90 @@ export class LogRepository {
 
   async aggregate(opts: AggregateOptions): Promise<AggregateBucket[]> {
     if (canUseRollup(opts.filters)) {
-      return this.aggregateFromRollup(opts);
+      const segments = planRollupSegments(opts.since, opts.until, opts.bucket);
+      if (segments.length === 0) return [];
+      const buckets = await this.aggregateFromRollup(opts, segments);
+      return this.mergePendingRollup(buckets, opts, segments);
     }
     return this.aggregateFromRaw(opts);
+  }
+
+  private mergePendingRollup(
+    buckets: AggregateBucket[],
+    opts: AggregateOptions,
+    segments: RollupSegment[]
+  ): AggregateBucket[] {
+    if (this.rollupQueue.size === 0) return buckets;
+
+    let bucketMsScale = 60_000;
+    if (opts.bucket === "5m") bucketMsScale = 300_000;
+    else if (opts.bucket === "1h") bucketMsScale = 3_600_000;
+    else if (opts.bucket === "1d") bucketMsScale = 86_400_000;
+
+    const pending = new Map<string, number>();
+
+    for (const [key, count] of this.rollupQueue.entries()) {
+      const parts = key.split("\t");
+      const tsMs = parseInt(parts[0]!, 10);
+      const service = parts[1]!;
+      const level = parts[2]!;
+
+      let inRollupSegment = false;
+      for (const seg of segments) {
+        if (seg.source === "raw") continue;
+        if (tsMs >= seg.from.getTime() && tsMs < seg.to.getTime()) {
+          inRollupSegment = true;
+          break;
+        }
+      }
+      if (!inRollupSegment) continue;
+
+      if (opts.filters.service !== undefined && opts.filters.service !== service) continue;
+      if (opts.filters.level !== undefined && opts.filters.level !== level) continue;
+
+      const binnedMs = Math.floor(tsMs / bucketMsScale) * bucketMsScale;
+      let groupKey = "";
+      if (opts.groupBy === "service") groupKey = service;
+      else if (opts.groupBy === "level") groupKey = level;
+
+      const pKey = `${binnedMs}\t${groupKey}`;
+      pending.set(pKey, (pending.get(pKey) ?? 0) + count);
+    }
+
+    if (pending.size === 0) return buckets;
+
+    const resultMap = new Map<string, AggregateBucket>();
+    for (const b of buckets) {
+      const binnedMs = b.start.getTime();
+      const groupKey = b.group ?? "";
+      const pKey = `${binnedMs}\t${groupKey}`;
+      resultMap.set(pKey, b);
+    }
+
+    for (const [pKey, count] of pending.entries()) {
+      const existing = resultMap.get(pKey);
+      if (existing) {
+        existing.count += count;
+      } else {
+        const parts = pKey.split("\t");
+        const binnedMs = parseInt(parts[0]!, 10);
+        const groupKey = parts[1]!;
+        resultMap.set(pKey, {
+          start: new Date(binnedMs),
+          group: opts.groupBy ? groupKey : null,
+          count,
+        });
+      }
+    }
+
+    return Array.from(resultMap.values()).sort((a, b) => {
+      const diff = a.start.getTime() - b.start.getTime();
+      if (diff !== 0) return diff;
+      if (a.group === b.group) return 0;
+      if (a.group === null) return -1;
+      if (b.group === null) return 1;
+      return a.group.localeCompare(b.group);
+    });
   }
 
   /**
@@ -611,10 +692,10 @@ export class LogRepository {
    * bucket size, then summed. A month at `bucket=1h` reads ~17k hourly rows
    * instead of ~1M raw rows.
    */
-  private async aggregateFromRollup(opts: AggregateOptions): Promise<AggregateBucket[]> {
-    const segments = planRollupSegments(opts.since, opts.until, opts.bucket);
-    if (segments.length === 0) return [];
-
+  private async aggregateFromRollup(
+    opts: AggregateOptions,
+    segments: RollupSegment[]
+  ): Promise<AggregateBucket[]> {
     const interval = BUCKET_TO_INTERVAL[opts.bucket];
     const groupCol = opts.groupBy ? GROUP_TO_COLUMN[opts.groupBy] : null;
     const params: unknown[] = [];
