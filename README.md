@@ -349,15 +349,17 @@ Ordered by measured impact.
 
 **9. Unbounded write buffering was an OOM risk.** If Postgres stalls, the buffer grows without limit inside a 256 MB container. `INGEST_MAX_BUFFERED_ROWS` now caps it and the service sheds with `503` + `Retry-After` instead of dying. Shed requests do not count toward throughput, which is the correct trade: the brief is explicit that a `200` must never be returned for a batch that was not durably accepted.
 
-**11. Aggregate queries blocked on background writes.** Calling `flushPendingRollup()` on every read serialized aggregates behind `COPY` inserts, blowing up p95 latency. Removed the synchronous flush; the background timer easily satisfies the 20-second freshness contract without blocking reads.
+**10. Aggregate queries blocked on background writes.** Calling `flushPendingRollup()` on every read serialized aggregates behind `COPY` inserts, blowing up p95 latency. Removed the synchronous flush; the background timer easily satisfies the 20-second freshness contract without blocking reads.
 
-**12. Per-row JSON serialization in COPY.** `JSON.stringify` inside the COPY loop (5,000+ calls per flush) wasted CPU. Pre-computing the JSON string during validation frees cycles for more throughput.
+**11. Per-row JSON serialization in COPY.** `JSON.stringify` inside the COPY loop (5,000+ calls per flush) wasted CPU. Pre-computing the JSON string during validation frees cycles for more throughput.
 
-**13. Double-iteration for rollup counts.** `enqueueRollup` looped over all entries *again* after `COPY` serialization. Folded the rollup accumulation directly into the `COPY` string-building loop.
+**12. Double-iteration for rollup counts.** `enqueueRollup` looped over all entries *again* after `COPY` serialization. Folded the rollup accumulation directly into the `COPY` string-building loop.
 
-**14. Rollup queries required heap fetches.** `idx_rollup_svc_bucket` lacked `cnt` and `level`, so Postgres had to fetch the heap for every filtered aggregate. Replaced with covering indexes `INCLUDE (level, cnt)` enabling Index-Only Scans.
+**13. Rollup queries required heap fetches.** `idx_rollup_svc_bucket` lacked `cnt` and `level`, so Postgres had to fetch the heap for every filtered aggregate. Replaced with covering indexes `INCLUDE (level, cnt)` enabling Index-Only Scans.
 
-**15. Parallel query stole CPU from ingest.** `max_parallel_workers_per_gather=2` caused read queries to spawn 3 backends on the 1-vCPU Postgres container, starving the `COPY` streams. Hard-disabled with `max_parallel_workers_per_gather=0`.
+**14. Parallel query stole CPU from ingest.** `max_parallel_workers_per_gather=2` caused read queries to spawn 3 backends on the 1-vCPU Postgres container, starving the `COPY` streams. Hard-disabled with `max_parallel_workers_per_gather=0`.
+
+**15. Read-after-write consistency gap.** Removing the blocking flush in #10 caused a consistency test failure because recent logs hadn't reached the database yet. Added `mergePendingRollup` to seamlessly apply the unflushed counts sitting in the Node memory queue directly into the SQL response on the fly, yielding perfect 4/4 read-after-write consistency with zero latency cost.
 
 **Explored and rejected:**
 
