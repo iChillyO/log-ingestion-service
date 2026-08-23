@@ -175,8 +175,9 @@ export class LogRepository {
   // Rollup accumulator. Flushes are chained onto `rollupInFlight` so at most
   // one runs at a time and callers (shutdown, tests) can await the tail.
   private rollupQueue = new Map<string, number>();
-  private rollupTimer: ReturnType<typeof setTimeout> | null = null;
+  private rollupTimer: NodeJS.Timeout | null = null;
   private rollupInFlight: Promise<void> = Promise.resolve();
+  private flushingRollup: Map<string, number> | null = null;
 
   constructor(
     private readonly pool: Pool,
@@ -455,6 +456,7 @@ export class LogRepository {
 
     const pending = this.rollupQueue;
     this.rollupQueue = new Map();
+    this.flushingRollup = pending;
 
     const buckets: string[] = [];
     const services: string[] = [];
@@ -497,6 +499,8 @@ export class LogRepository {
         this.rollupQueue.set(key, (this.rollupQueue.get(key) ?? 0) + cnt);
       }
       this.scheduleRollupFlush();
+    } finally {
+      this.flushingRollup = null;
     }
   }
 
@@ -613,7 +617,9 @@ export class LogRepository {
     opts: AggregateOptions,
     segments: RollupSegment[]
   ): AggregateBucket[] {
-    if (this.rollupQueue.size === 0) return buckets;
+    if (this.rollupQueue.size === 0 && (!this.flushingRollup || this.flushingRollup.size === 0)) {
+      return buckets;
+    }
 
     let bucketMsScale = 60_000;
     if (opts.bucket === "5m") bucketMsScale = 300_000;
@@ -622,32 +628,39 @@ export class LogRepository {
 
     const pending = new Map<string, number>();
 
-    for (const [key, count] of this.rollupQueue.entries()) {
-      const parts = key.split("\t");
-      const tsMs = parseInt(parts[0]!, 10);
-      const service = parts[1]!;
-      const level = parts[2]!;
+    const mergeSource = (source: Map<string, number>) => {
+      for (const [key, count] of source.entries()) {
+        const parts = key.split("\t");
+        const tsMs = parseInt(parts[0]!, 10);
+        const service = parts[1]!;
+        const level = parts[2]!;
 
-      let inRollupSegment = false;
-      for (const seg of segments) {
-        if (seg.source === "raw") continue;
-        if (tsMs >= seg.from.getTime() && tsMs < seg.to.getTime()) {
-          inRollupSegment = true;
-          break;
+        let inRollupSegment = false;
+        for (const seg of segments) {
+          if (seg.source === "raw") continue;
+          if (tsMs >= seg.from.getTime() && tsMs < seg.to.getTime()) {
+            inRollupSegment = true;
+            break;
+          }
         }
+        if (!inRollupSegment) continue;
+
+        if (opts.filters.service !== undefined && opts.filters.service !== service) continue;
+        if (opts.filters.level !== undefined && opts.filters.level !== level) continue;
+
+        const binnedMs = Math.floor(tsMs / bucketMsScale) * bucketMsScale;
+        let groupKey = "";
+        if (opts.groupBy === "service") groupKey = service;
+        else if (opts.groupBy === "level") groupKey = level;
+
+        const pKey = `${binnedMs}\t${groupKey}`;
+        pending.set(pKey, (pending.get(pKey) ?? 0) + count);
       }
-      if (!inRollupSegment) continue;
+    };
 
-      if (opts.filters.service !== undefined && opts.filters.service !== service) continue;
-      if (opts.filters.level !== undefined && opts.filters.level !== level) continue;
-
-      const binnedMs = Math.floor(tsMs / bucketMsScale) * bucketMsScale;
-      let groupKey = "";
-      if (opts.groupBy === "service") groupKey = service;
-      else if (opts.groupBy === "level") groupKey = level;
-
-      const pKey = `${binnedMs}\t${groupKey}`;
-      pending.set(pKey, (pending.get(pKey) ?? 0) + count);
+    mergeSource(this.rollupQueue);
+    if (this.flushingRollup) {
+      mergeSource(this.flushingRollup);
     }
 
     if (pending.size === 0) return buckets;
